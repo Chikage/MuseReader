@@ -1,90 +1,91 @@
 # MuseReader
 
-MuseReader 是一个 Flutter Android/iOS 只读谱面阅读器。它支持从系统文件选择器打开 `MSCX` 和 `MSCZ`，查看分页谱面、缩放/平移，并按谱面时间线播放和高亮音符；产品界面没有编辑、保存或导出功能。
+MuseReader 是一个 Android/iOS 双端 Flutter 只读谱面阅读器。它支持通过系统文件选择器打开 `MSCX` 和 `MSCZ`，使用 MuseScore 3.6.2 原生排版器生成分页谱面，并按同一份展开反复后的原生时间线播放、定位和高亮音符。产品界面不包含编辑、保存或导出功能。
 
-## 当前功能
+## 移动端原生状态
 
-- Flutter Material 3 阅读界面，适配手机竖屏、横屏和平板宽度。
-- `MSCZ` 使用 `META-INF/container.xml` 查找根 `MSCX`；`MSCX` 直接解析 XML。
-- 播放位置使用整数微秒和单调时钟，音符事件同时保留 tick 与 `startUs/endUs`，拖动进度条、变速和分页都基于同一时间线。
-- Android 使用 NDK/JNI 壳，iOS 使用 Objective-C/Swift bridging header；两个平台都优先请求 MuseScore 原生引擎，缺少引擎时才回退到 Dart 兼容解析器和系统音频合成器。
-- 附带 `assets/demo/reader-demo.mscx`，安装后可以直接验证阅读和播放流程。
+两个移动端目标均锁定为 arm64，并默认要求原生核心：
 
-## 精确渲染架构
+| 平台 | 目标 | 原生交付 |
+| --- | --- | --- |
+| Android | `arm64-v8a`，NDK `28.2.13676358` | `libmuse_reader_engine.so` 静态吸收 `libmscore`、qzip、FreeType、qminimal 与资源；APK 同时携带 Qt 5.15.2 Core/Gui/Widgets/Xml/Svg 和 `libc++_shared.so` |
+| iOS | `iphoneos/arm64`，最低 iOS 13 | `MuseReaderEngine.framework` 静态吸收 Qt 5.15.2、`libmscore`、qzip、FreeType、qminimal 与资源，仅保留 Apple 系统动态依赖 |
 
-要满足所有 MuseScore 3.6.2 记谱语义的完全一致显示，不能在 Flutter 中重新实现排版器。原生适配器位于 [native/musescore_engine/muse_reader_engine.cpp](native/musescore_engine/muse_reader_engine.cpp)，按附件源码中的核心路径工作：
+`ScoreRepository` 对 Android/iOS 使用 `MUSE_READER_REQUIRE_NATIVE=true` 的 fail-closed 语义，原生核心缺失或初始化失败时会明确报错，不会静默切换到兼容排版。构建脚本仍显式传入该 define，避免发布命令的意图不清晰。Dart 兼容解析器仅保留给非移动端测试和开发诊断。
+
+## 精确渲染与进度
+
+原生适配器位于 [native/musescore_engine/muse_reader_engine.cpp](native/musescore_engine/muse_reader_engine.cpp)，直接复用附件 MuseScore 3.6.2 的核心路径：
 
 1. `MasterScore::loadMsc()` 读取 `MSCX/MSCZ`。
 2. `MasterScore::doLayout()` 生成 MuseScore 原生页面布局。
-3. `Score::print()` 将每页绘制成 PNG，Flutter 只负责显示和缩放。
-4. `Score::renderMidi(..., expandRepeats=true, ...)` 生成展开反复后的事件流。
-5. `Score::utick2utime()` 计算包含速度变化和反复偏移的微秒时间。
+3. `Score::print()` 将每页绘制为 PNG，Flutter 只负责显示、缩放和平移。
+4. `Score::renderMidi(..., expandRepeats=true, ...)` 生成展开反复后的播放事件。
+5. `Score::utick2utime()` 通过原生 `TempoMap` 与 `RepeatList` 生成整数微秒时间。
 
-原生 JSON 的页面图像、音符时间戳和 `Note::pageBoundingRect()` 页内矩形共享同一 `MasterScore`，因此谱面高亮不会再经过第二套 Flutter 几何推算。适配器的 C ABI、Android JNI 与 iOS 调用入口已经接入工程，见 [native/musescore_engine/README.md](native/musescore_engine/README.md)。
+页面图像、音符 `startUs/endUs` 和 `Note::pageBoundingRect()` 均来自同一个已排版的 `MasterScore`。播放指针、拖动、变速、分页与高亮因此共享同一时间源和几何坐标，不经过 Flutter 的二次排版或 tick 估算。
 
-仓库当前默认构建不携带 Qt 和 MuseScore 静态库，所以默认 APK/iOS bundle 使用兼容模式；这个模式用于开发、演示和基础 MSCX/MSCZ 读取，不能宣称对复杂连音、反复、字体和所有布局细节完全等同 MuseScore。要发布“完全精准”版本，必须为每个 Android ABI 和 iOS 架构构建匹配的 Qt 运行库、MuseScore `libmscore` 以及 freetype、qzip、audio 等依赖，再启用 `MUSE_READER_WITH_MUSESCORE`。单独链接附件中的桌面 `libmscore.a` 不够。
+## 构建与打包
 
-## 开发与验证
+要求 macOS、Xcode、Flutter、CMake、`curl`、`bsdtar`、`shasum`，以及相邻目录中的 MuseScore 源码：
 
-在仓库根目录执行：
+```text
+/Volumes/Files/Github/
+├── MuseReader/
+└── MuseScore-3.6.2/
+```
+
+执行完整 arm64 构建：
 
 ```sh
-flutter pub get
+./tool/build_mobile_arm64.sh all
+```
+
+脚本会从 Qt 官方归档下载并校验 Qt 5.15.2 Android/iOS Core、Gui、Widgets、Xml、Svg 组件和 Android qminimal 所需的 QtBase 源码，然后直接从 MuseScore 3.6.2 源码交叉编译 `libmscore` 及依赖。也可只构建一个平台或只审计已有产物：
+
+```sh
+./tool/build_mobile_arm64.sh android
+./tool/build_mobile_arm64.sh ios
+./tool/build_mobile_arm64.sh verify
+```
+
+默认输出：
+
+- `build/releases/MuseReader-android-arm64-release.apk`
+- `build/releases/MuseReader-ios-arm64-unsigned.ipa`
+- `ios/Frameworks/MuseReaderEngine.framework`
+
+可通过 `MUSESCORE_SOURCE_DIR` 覆盖源码位置。Android release 当前沿用 Flutter 模板的调试签名；iOS IPA 未签名。上架或真机分发前必须配置正式 Android keystore 和 Apple Team/Provisioning Profile 后重新签名构建。
+
+等价的最终 Flutter 命令为：
+
+```sh
+flutter build apk --release --target-platform android-arm64 \
+  --dart-define=MUSE_READER_REQUIRE_NATIVE=true
+flutter build ios --release --no-codesign \
+  --dart-define=MUSE_READER_REQUIRE_NATIVE=true
+```
+
+## 开发验证
+
+```sh
 flutter analyze
 flutter test
-flutter run -d <device-id>
 ```
 
-默认平台构建：
+脚本的 `verify` 模式还会检查 APK 只含 `arm64-v8a`、所需 Qt/NDK 运行库均已打包、iOS Runner/Flutter/App/原生 Framework 都只含 arm64，并确认 C ABI 导出符号存在。
 
-```sh
-flutter build apk --debug
-flutter build ios --no-codesign
-```
+主要源码入口：
 
-精确发布包建议同时使用 `--dart-define=MUSE_READER_REQUIRE_NATIVE=true`；如果目标 ABI 没有正确打包 MuseScore 核心，应用会明确报错而不会静默显示兼容排版：
+- [lib/src/services/score_repository.dart](lib/src/services/score_repository.dart)：原生核心强制策略。
+- [lib/src/services/muse_score_bridge.dart](lib/src/services/muse_score_bridge.dart)：原生 JSON 到 Flutter 谱面模型的映射。
+- [lib/src/playback/playback_controller.dart](lib/src/playback/playback_controller.dart)：微秒时间线、拖动、变速和高亮状态。
+- [lib/src/ui/reader_page.dart](lib/src/ui/reader_page.dart)：只读阅读界面。
+- [android/app/src/main/kotlin/com/musereader/muse_reader/MainActivity.kt](android/app/src/main/kotlin/com/musereader/muse_reader/MainActivity.kt)：Android 文件选择、JNI 通道和音频调度。
+- [ios/Runner/AppDelegate.swift](ios/Runner/AppDelegate.swift)：iOS 文件选择、C ABI 通道和音频调度。
 
-```sh
-flutter build apk --release --dart-define=MUSE_READER_REQUIRE_NATIVE=true
-flutter build ios --release --no-codesign --dart-define=MUSE_READER_REQUIRE_NATIVE=true
-```
-
-本机 Qt5 适配器编译验证（路径按实际工具链调整）：
-
-```sh
-cmake -S native/musescore_engine -B build/muse_reader_engine \
-  -DMUSE_READER_WITH_MUSESCORE=ON \
-  -DMUSESCORE_SOURCE_DIR=/Volumes/Files/Github/MuseScore-3.6.2 \
-  -DMUSESCORE_BUILD_DIR=/path/to/musescore/build \
-  -DMUSESCORE_LIBRARIES="/path/to/all/required/static/libraries"
-cmake --build build/muse_reader_engine --config Release
-```
-
-Android 可以把同一组 CMake 参数通过 Gradle 属性传入：
-
-```sh
-ORG_GRADLE_PROJECT_museReaderWithMuseScore=true \
-ORG_GRADLE_PROJECT_museScoreSourceDir=/path/to/MuseScore-3.6.2 \
-ORG_GRADLE_PROJECT_museScoreBuildDir=/path/to/target/musescore/build \
-ORG_GRADLE_PROJECT_museScoreLibraries='/path/to/liblibmscore.a;/path/to/other/dependency.a' \
-ORG_GRADLE_PROJECT_museReaderQtPrefixPath=/path/to/target/qt \
-flutter build apk --release --dart-define=MUSE_READER_REQUIRE_NATIVE=true
-```
-
-Android 的 JNI 目标会自动链接 `muse_reader_engine_core`；iOS 的 Runner target 已包含 C ABI 源文件。启用精确核心时，还需要在平台工程中提供目标平台 Qt framework/so、头文件、资源文件和完整静态库列表，具体依赖由 MuseScore/Qt 工具链决定，不能用桌面库路径替代。
-
-## 源码说明
-
-- [lib/main.dart](lib/main.dart)：应用入口和主题。
-- [lib/src/services/score_parser.dart](lib/src/services/score_parser.dart)：MSCX/MSCZ 兼容解析器。
-- [lib/src/model/score_document.dart](lib/src/model/score_document.dart)：谱面模型、tempo map 和微秒时间线。
-- [lib/src/playback/playback_controller.dart](lib/src/playback/playback_controller.dart)：播放、拖动、变速和高亮状态。
-- [lib/src/ui/reader_page.dart](lib/src/ui/reader_page.dart)：只读阅读页及响应式播放栏。
-- [android/app/src/main/kotlin/com/musereader/muse_reader/MainActivity.kt](android/app/src/main/kotlin/com/musereader/muse_reader/MainActivity.kt)：Android 文件选择、JNI 通道和音频回退。
-- [ios/Runner/AppDelegate.swift](ios/Runner/AppDelegate.swift)：iOS 文件选择、C ABI 通道和音频回退。
-
-附件中的 `BUILDING.md`、`BUILD_COMMANDS.md` 属于 MuseScore 源码本身的编译参考，不是 MuseReader 的产品需求；本项目只采用其中与构建 `libmscore` 有关的技术信息，不引入编辑器功能。
+附件源码中的说明文件属于 MuseScore 自身，不是 MuseReader 的产品需求。本项目只采用实现只读加载、原生排版和播放时间线所需的代码，不引入编辑器功能。
 
 ## 许可证
 
-MuseScore 3.6.2 代码采用 GPLv2。启用并分发原生核心时请同时遵守 [NOTICE-MUSESCORE.md](NOTICE-MUSESCORE.md) 及附件源码中的许可证和源代码提供义务。
+MuseScore 3.6.2 代码采用 GPLv2，移动包还包含 Qt 5.15.2、FreeType 与 qzip。分发前必须遵守 [NOTICE-MUSESCORE.md](NOTICE-MUSESCORE.md)、Qt 官方许可条款及附件源码中的许可证、通知和对应源代码提供义务。

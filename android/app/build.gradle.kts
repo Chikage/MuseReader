@@ -4,25 +4,27 @@ plugins {
     id("dev.flutter.flutter-gradle-plugin")
 }
 
-val museReaderCmakeArgs = mutableListOf<String>()
-if (project.findProperty("museReaderWithMuseScore") == "true") {
-    museReaderCmakeArgs += "-DMUSE_READER_WITH_MUSESCORE=ON"
-    mapOf(
-        "museScoreSourceDir" to "MUSESCORE_SOURCE_DIR",
-        "museScoreBuildDir" to "MUSESCORE_BUILD_DIR",
-        "museScoreLibraries" to "MUSESCORE_LIBRARIES",
-        "museReaderQtPrefixPath" to "CMAKE_PREFIX_PATH",
-    ).forEach { (propertyName, cmakeName) ->
-        project.findProperty(propertyName)?.toString()?.let { value ->
-            museReaderCmakeArgs += "-D$cmakeName=$value"
-        }
-    }
-}
+val museReaderRoot = rootProject.projectDir.parentFile
+val museScoreSource = project.findProperty("museScoreSourceDir")?.toString()
+    ?: File(museReaderRoot.parentFile, "MuseScore-3.6.2").canonicalPath
+val museReaderQt = project.findProperty("museReaderQtDir")?.toString()
+    ?: File(museReaderRoot, "build/toolchains/qt/android/5.15.2/android").canonicalPath
+val museReaderQtBaseSource = project.findProperty("museReaderQtBaseSourceDir")?.toString()
+    ?: File(museReaderRoot, "build/toolchains/src/qtbase-everywhere-src-5.15.2").canonicalPath
+val museReaderCmakeArgs = listOf(
+    "-DMUSE_READER_BUILD_MUSESCORE_SOURCE=ON",
+    "-DMUSESCORE_SOURCE_DIR=$museScoreSource",
+    "-DMUSE_READER_QTBASE_SOURCE_DIR=$museReaderQtBaseSource",
+    "-DQt5_DIR=$museReaderQt/lib/cmake/Qt5",
+    "-DCMAKE_PREFIX_PATH=$museReaderQt",
+    "-DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH",
+    "-DANDROID_STL=c++_shared",
+)
 
 android {
     namespace = "com.musereader.muse_reader"
     compileSdk = flutter.compileSdkVersion
-    ndkVersion = flutter.ndkVersion
+    ndkVersion = "28.2.13676358"
 
     externalNativeBuild {
         cmake {
@@ -45,6 +47,11 @@ android {
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+
+        ndk {
+            abiFilters.clear()
+            abiFilters += "arm64-v8a"
+        }
 
         externalNativeBuild {
             cmake {

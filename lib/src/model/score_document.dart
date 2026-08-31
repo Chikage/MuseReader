@@ -39,6 +39,8 @@ class ScorePage {
     required this.height,
     required this.glyphs,
     this.imageBytes,
+    this.pixelWidth,
+    this.pixelHeight,
   });
 
   final int index;
@@ -49,6 +51,11 @@ class ScorePage {
   /// A page rendered by the MuseScore native backend, when available.
   /// The Dart painter is used only when this is null.
   final Uint8List? imageBytes;
+
+  /// Native raster dimensions. Logical [width]/[height] remain the coordinate
+  /// space shared with note highlight rectangles.
+  final int? pixelWidth;
+  final int? pixelHeight;
 }
 
 class ScoreMeasure {
@@ -228,6 +235,8 @@ class ScoreDocument {
     required this.endTick,
     required this.backend,
     this.durationUsOverride,
+    this.symbolFont,
+    this.renderDpi,
   });
 
   final String sourcePath;
@@ -243,6 +252,8 @@ class ScoreDocument {
   final int endTick;
   final String backend;
   final int? durationUsOverride;
+  final String? symbolFont;
+  final int? renderDpi;
 
   int get durationUs =>
       durationUsOverride ??

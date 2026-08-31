@@ -8,6 +8,9 @@ import UIKit
   private var pendingFileResult: FlutterResult?
   private var activePicker: UIDocumentPickerViewController?
   private let synth = SimpleScoreSynth()
+  private let engineQueue = DispatchQueue(label: "com.musereader.musescore-engine")
+  private var nativeEngineAvailable = false
+  private var nativeEngineReady = false
 
   override func application(
     _ application: UIApplication,
@@ -19,6 +22,8 @@ import UIKit
   func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
     GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
     let messenger = engineBridge.applicationRegistrar.messenger()
+    nativeEngineAvailable = muse_reader_is_available() != 0
+    nativeEngineReady = nativeEngineAvailable && muse_reader_initialize() != 0
 
     let fileChannel = FlutterMethodChannel(
       name: "com.musereader/files",
@@ -44,17 +49,36 @@ import UIKit
       case "open":
         let arguments = call.arguments as? [String: Any] ?? [:]
         guard let path = arguments["path"] as? String, !path.isEmpty else {
-          result(["available": false])
+          result([
+            "available": self.nativeEngineAvailable,
+            "error": "The score path is empty.",
+          ])
           return
         }
-        DispatchQueue.global(qos: .userInitiated).async {
+        guard self.nativeEngineReady else {
+          result([
+            "available": self.nativeEngineAvailable,
+            "error": self.nativeErrorMessage(
+              fallback: "MuseScore native initialization failed."
+            ),
+          ])
+          return
+        }
+        self.engineQueue.async {
           let document = self.nativeDocument(path: path)
+          let response: [String: Any]
+          if let document {
+            response = ["available": true, "document": document]
+          } else {
+            response = [
+              "available": self.nativeEngineAvailable,
+              "error": self.nativeErrorMessage(
+                fallback: "MuseScore native rendering failed."
+              ),
+            ]
+          }
           DispatchQueue.main.async {
-            if let document {
-              result(["available": true, "document": document])
-            } else {
-              result(["available": false])
-            }
+            result(response)
           }
         }
       case "startAudio":
@@ -135,6 +159,12 @@ import UIKit
     defer { muse_reader_free_json(jsonPointer) }
     let data = Data(bytes: jsonPointer, count: strlen(jsonPointer))
     return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+  }
+
+  private func nativeErrorMessage(fallback: String) -> String {
+    guard let error = muse_reader_last_error() else { return fallback }
+    let message = String(cString: error)
+    return message.isEmpty ? fallback : message
   }
 
   private func topViewController() -> UIViewController? {

@@ -28,6 +28,8 @@ class MainActivity : FlutterActivity() {
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         synth = SimpleScoreSynth()
+        val engineAvailable = NativeMuseScoreEngine.isAvailable()
+        val engineReady = engineAvailable && NativeMuseScoreEngine.initialize()
 
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, FILE_CHANNEL)
             .setMethodCallHandler { call, result ->
@@ -43,12 +45,33 @@ class MainActivity : FlutterActivity() {
                     "open" -> {
                         val path = call.argument<String>("path")
                         if (path.isNullOrBlank()) {
-                            result.success(mapOf("available" to false))
+                            result.success(
+                                mapOf(
+                                    "available" to engineAvailable,
+                                    "error" to "The score path is empty.",
+                                ),
+                            )
+                        } else if (!engineReady) {
+                            result.success(
+                                mapOf(
+                                    "available" to engineAvailable,
+                                    "error" to (
+                                        NativeMuseScoreEngine.lastError()
+                                            ?: "MuseScore native initialization failed."
+                                    ),
+                                ),
+                            )
                         } else {
                             engineExecutor.execute {
                                 val json = NativeMuseScoreEngine.open(path)
                                 val response = if (json == null) {
-                                    mapOf("available" to false)
+                                    mapOf(
+                                        "available" to engineAvailable,
+                                        "error" to (
+                                            NativeMuseScoreEngine.lastError()
+                                                ?: "MuseScore native rendering failed."
+                                        ),
+                                    )
                                 } else {
                                     try {
                                         mapOf(
@@ -57,7 +80,7 @@ class MainActivity : FlutterActivity() {
                                         )
                                     } catch (error: Exception) {
                                         mapOf(
-                                            "available" to false,
+                                            "available" to engineAvailable,
                                             "error" to (error.message ?: "Invalid native document"),
                                         )
                                     }

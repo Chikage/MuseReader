@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/services.dart';
 
 import '../model/score_document.dart';
@@ -7,11 +9,13 @@ import 'score_parser.dart';
 class ScoreRepository {
   ScoreRepository({ScoreParser? parser}) : _parser = parser ?? ScoreParser();
 
-  /// Exact-release builds can fail closed instead of silently using the
-  /// compatibility renderer when the platform core was not packaged.
-  static const requireNative = bool.fromEnvironment(
+  /// Mobile builds fail closed instead of silently using compatibility layout.
+  static const _requireNativeBuild = bool.fromEnvironment(
     'MUSE_READER_REQUIRE_NATIVE',
+    defaultValue: true,
   );
+  static bool get requireNative =>
+      _requireNativeBuild && (Platform.isAndroid || Platform.isIOS);
 
   final ScoreParser _parser;
 
@@ -26,9 +30,44 @@ class ScoreRepository {
 
   Future<ScoreDocument> openAsset(String assetPath) async {
     final bytes = await rootBundle.load(assetPath);
-    return _parser.parseBytes(
-      bytes.buffer.asUint8List(bytes.offsetInBytes, bytes.lengthInBytes),
-      assetPath,
+    final data = bytes.buffer.asUint8List(
+      bytes.offsetInBytes,
+      bytes.lengthInBytes,
     );
+    if (Platform.isAndroid || Platform.isIOS) {
+      try {
+        final nativePath = await _materializeAsset(assetPath, data);
+        final nativeDocument = await MuseScoreBridge.open(
+          nativePath,
+          sourcePath: assetPath,
+        );
+        if (nativeDocument != null) return nativeDocument;
+      } on FileSystemException catch (error) {
+        if (requireNative) {
+          throw ScoreParseException(
+            '无法为 MuseScore 原生核心准备内置谱面：${error.message}',
+          );
+        }
+      }
+    }
+    if (requireNative) {
+      throw const ScoreParseException('此版本要求 MuseScore 原生核心，但当前平台没有加载该核心。');
+    }
+    return _parser.parseBytes(data, assetPath);
+  }
+
+  Future<String> _materializeAsset(String assetPath, Uint8List bytes) async {
+    final fileName = assetPath
+        .replaceAll('\\', '/')
+        .split('/')
+        .last
+        .replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_');
+    final directory = Directory(
+      '${Directory.systemTemp.path}/muse_reader/bundled_scores',
+    );
+    await directory.create(recursive: true);
+    final file = File('${directory.path}/$fileName');
+    await file.writeAsBytes(bytes, flush: true);
+    return file.path;
   }
 }

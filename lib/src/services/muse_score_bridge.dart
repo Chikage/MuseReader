@@ -4,29 +4,32 @@ import 'package:flutter/services.dart';
 
 import '../model/score_document.dart';
 
-/// Contract between Flutter and the optional MuseScore C++ core.
+/// Contract between Flutter and the required mobile MuseScore C++ core.
 ///
-/// The native implementation is intentionally optional in the first build:
-/// the app remains useful with the compatibility parser, and a platform build
-/// can enable the exact MuseScore layout/MIDI adapter without changing UI code.
+/// Non-mobile tests may run without the platform channel, but Android and iOS
+/// product builds fail closed when the native renderer is unavailable.
 class MuseScoreBridge {
   MuseScoreBridge._();
 
   static const _channel = MethodChannel('com.musereader/musescore_engine');
 
-  static Future<ScoreDocument?> open(String path) async {
+  static Future<ScoreDocument?> open(String path, {String? sourcePath}) async {
     try {
       final raw = await _channel.invokeMethod<Object?>('open', {'path': path});
       if (raw is! Map) return null;
       final available = raw['available'] == true;
       if (!available) return null;
       final payload = raw['document'];
-      if (payload is! Map) return null;
-      return _documentFromMap(payload, path);
+      if (payload is! Map) {
+        throw MuseScoreBridgeException(
+          _asString(raw['error'], fallback: 'MuseScore 原生核心没有返回谱面文档。'),
+        );
+      }
+      return _documentFromMap(payload, sourcePath ?? path);
     } on MissingPluginException {
       return null;
-    } on PlatformException {
-      return null;
+    } on PlatformException catch (error) {
+      throw MuseScoreBridgeException(error.message ?? 'MuseScore 原生通道调用失败。');
     }
   }
 
@@ -63,6 +66,9 @@ class MuseScoreBridge {
     String path,
   ) {
     final division = _asInt(map['division'], fallback: 480);
+    if (division <= 0) {
+      throw const MuseScoreBridgeException('MuseScore 返回了无效的 tick division。');
+    }
     final title = _asString(map['title'], fallback: _fileName(path));
     final composer = _asString(map['composer']);
     final tempoPoints = <TempoPoint>[];
@@ -142,21 +148,30 @@ class MuseScoreBridge {
       for (var index = 0; index < rawPages.length; index++) {
         final raw = rawPages.elementAt(index);
         if (raw is! Map) continue;
+        final width = _asDouble(raw['width']);
+        final height = _asDouble(raw['height']);
+        final imageBytes = _bytesOrNull(raw['image']);
+        if (width <= 0 || height <= 0) {
+          throw MuseScoreBridgeException('MuseScore 第 ${index + 1} 页尺寸无效。');
+        }
+        if (imageBytes == null || imageBytes.isEmpty) {
+          throw MuseScoreBridgeException('MuseScore 第 ${index + 1} 页缺少完整渲染图像。');
+        }
         pages.add(
           ScorePage(
             index: _asInt(raw['index'], fallback: index),
-            width: _asDouble(raw['width'], fallback: 820),
-            height: _asDouble(raw['height'], fallback: 1160),
+            width: width,
+            height: height,
             glyphs: const [],
-            imageBytes: _bytesOrNull(raw['image']),
+            imageBytes: imageBytes,
+            pixelWidth: _asPositiveIntOrNull(raw['pixelWidth']),
+            pixelHeight: _asPositiveIntOrNull(raw['pixelHeight']),
           ),
         );
       }
     }
     if (pages.isEmpty) {
-      pages.add(
-        const ScorePage(index: 0, width: 820, height: 1160, glyphs: []),
-      );
+      throw const MuseScoreBridgeException('MuseScore 原生核心没有返回任何已渲染页面。');
     }
     final endTick = _asInt(
       map['endTick'],
@@ -166,6 +181,11 @@ class MuseScoreBridge {
       ),
     );
     final durationUs = _asIntOrNull(map['durationUs']);
+    final renderer = _asString(
+      map['renderer'],
+      fallback: 'MuseScore native core',
+    );
+    final symbolFont = _asString(map['symbolFont']);
     return ScoreDocument(
       sourcePath: path,
       fileName: _fileName(path),
@@ -178,8 +198,10 @@ class MuseScoreBridge {
       events: List.unmodifiable(events),
       pages: List.unmodifiable(pages),
       endTick: endTick,
-      backend: 'MuseScore native core',
+      backend: renderer,
       durationUsOverride: durationUs,
+      symbolFont: symbolFont.isEmpty ? null : symbolFont,
+      renderDpi: _asPositiveIntOrNull(map['renderDpi']),
     );
   }
 
@@ -223,6 +245,11 @@ class MuseScoreBridge {
     return _asInt(value);
   }
 
+  static int? _asPositiveIntOrNull(dynamic value) {
+    final result = _asIntOrNull(value);
+    return result != null && result > 0 ? result : null;
+  }
+
   static double _asDouble(dynamic value, {double fallback = 0}) {
     if (value is num) return value.toDouble();
     return double.tryParse('$value') ?? fallback;
@@ -242,4 +269,13 @@ class MuseScoreBridge {
     final dot = path.lastIndexOf('.');
     return dot < 0 ? '' : path.substring(dot + 1).toLowerCase();
   }
+}
+
+class MuseScoreBridgeException implements Exception {
+  const MuseScoreBridgeException(this.message);
+
+  final String message;
+
+  @override
+  String toString() => message;
 }

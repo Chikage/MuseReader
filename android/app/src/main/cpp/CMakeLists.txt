@@ -22,6 +22,5 @@ add_library(
 target_compile_features(muse_reader_engine PRIVATE cxx_std_17)
 target_link_libraries(muse_reader_engine PRIVATE muse_reader_engine_core)
 
-# The default mobile artifact deliberately uses the engine's small stub. A
-# product build can add the MuseScore source/library flags described in
-# native/musescore_engine/README.md without changing the Flutter channel.
+# Gradle always enables the source-built MuseScore core for the arm64 product
+# artifact. Keeping the JNI shell separate makes the Flutter channel stable.

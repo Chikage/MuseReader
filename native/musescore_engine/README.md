@@ -1,64 +1,69 @@
 # MuseScore native backend
 
-This directory contains the narrow C ABI used by the Flutter reader. The
-default Flutter build does not link Qt or MuseScore; it uses the read-only Dart
-compatibility parser and the platform tone fallback. Product builds that need
-MuseScore 3.6.2 fidelity should enable `MUSE_READER_WITH_MUSESCORE` and link
-the `libmscore` static library built from:
+This directory builds the required mobile C ABI around MuseScore 3.6.2. The
+Android and iOS product artifacts compile `libmscore` from the attached source;
+they do not use the former stub or a desktop MuseScore binary.
 
-`/Volumes/Files/Github/MuseScore-3.6.2/`
+The adapter uses the same source of truth for engraving and playback:
 
-The adapter deliberately calls the same operations used by the attached
-source:
+1. `MasterScore::loadMsc()` reads MSCX and MSCZ.
+2. `MasterScore::doLayout()` computes native page geometry.
+3. `Score::print()` paints each page to PNG.
+4. `Score::renderMidi(..., expandRepeats=true, ...)` creates the expanded event
+   stream.
+5. `Score::utick2utime()` converts expanded ticks through MuseScore's
+   `TempoMap` and `RepeatList`.
 
-1. `MasterScore::loadMsc()` reads both MSCX and the MSCZ container.
-2. `MasterScore::doLayout()` computes the page geometry.
-3. `Score::print()` paints each page into a PNG without reimplementing music
-   engraving in Flutter.
-4. `Score::renderMidi(..., expandRepeats=true, ...)` creates the unrolled
-   playback event stream.
-5. `Score::utick2utime()` converts expanded ticks through the original
-   `TempoMap` and `RepeatList`, including tempo changes and repeat offsets.
+The JSON response contains rendered pages, integer-microsecond event times, and
+`Note::pageBoundingRect()` coordinates from the same laid-out `MasterScore`.
+Flutter therefore does not reconstruct engraving geometry or playback timing.
 
-The JSON payload is consumed by
-`lib/src/services/muse_score_bridge.dart`. Its page `image` values are base64
-PNG data. Each note event contains tick and microsecond coordinates plus a
-`rect` in the rendered page's coordinate system, taken from
-`Note::pageBoundingRect()` after layout. This keeps visual rendering and
-playback highlighting on the same source of truth. Android's
-`NativeMuseScoreEngine` JNI wrapper and iOS's bridging-header call both use
-this C ABI; an unavailable core returns `available: false`, so the Dart
-repository can select its compatibility path deterministically.
+## Source build
 
-## Building a product backend
+`MUSE_READER_BUILD_MUSESCORE_SOURCE=ON` adds the upstream `libmscore`, qzip and
+FreeType targets directly. It also compiles the MIDI event implementation,
+embeds the MuseScore fonts/styles/instrument resources, and selects the minimal
+Qt platform plugin for headless page rendering.
 
-Build a Qt kit for the target platform first, then configure this directory
-with the MuseScore source and the complete set of static libraries produced by
-its `libmscore` target. The exact library list is platform/toolchain-specific,
-so it is passed as `MUSESCORE_LIBRARIES` rather than guessed here:
+Android's Gradle build enables this mode automatically and emits only
+`arm64-v8a`. The JNI shared object contains the static MuseScore dependencies;
+Qt 5.15.2 Core, Gui, Widgets, Xml and Svg plus `libc++_shared.so` are packaged as
+APK shared libraries.
+
+iOS builds a dynamic `MuseReaderEngine.framework` for `iphoneos/arm64`. Qt,
+MuseScore, qzip, FreeType, qminimal, and reader resources are linked into that
+framework, leaving only Apple system frameworks and libraries as dynamic
+dependencies. Runner embeds and signs the framework when a signed app build is
+performed.
+
+Use the project wrapper to download the pinned Qt kits, build both platforms,
+package the results, and audit their architectures:
 
 ```sh
-cmake -S native/musescore_engine -B build/muse_reader_engine \
-  -DMUSE_READER_WITH_MUSESCORE=ON \
-  -DMUSESCORE_SOURCE_DIR=/Volumes/Files/Github/MuseScore-3.6.2 \
-  -DMUSESCORE_BUILD_DIR=/path/to/musescore/build \
-  -DMUSESCORE_LIBRARIES="..."
-cmake --build build/muse_reader_engine --config Release
+./tool/build_mobile_arm64.sh all
 ```
 
-For Android, pass the target-platform Qt and MuseScore include/library paths to
-the NDK CMake target under `android/app/src/main/cpp`; it wraps the core in
-`libmuse_reader_engine.so` and calls the C ABI from `MainActivity`. For iOS,
-add the target-platform static libraries and Qt frameworks to the Runner
-target; the checked-in C++ source is already part of that target and is called
-from `AppDelegate.swift` through `Runner-Bridging-Header.h`. Do not compile
-the desktop `mscore` GUI target into a mobile app.
+The equivalent standalone iOS framework configuration is:
 
-The supplied desktop Qt5 build is useful for compiling and inspecting the
-adapter, but it is not a mobile binary. A release build must use a matching
-Qt/MuseScore toolchain for every shipped architecture and must include the
-MuseScore data resources required by the selected fonts and instruments.
+```sh
+cmake -S native/musescore_engine -B build/native-ios-arm64 -G Xcode \
+  -DMUSE_READER_BUILD_MUSESCORE_SOURCE=ON \
+  -DMUSE_READER_BUILD_IOS_FRAMEWORK=ON \
+  -DMUSESCORE_SOURCE_DIR=/Volumes/Files/Github/MuseScore-3.6.2 \
+  -DCMAKE_SYSTEM_NAME=iOS \
+  -DCMAKE_OSX_SYSROOT=iphoneos \
+  -DCMAKE_OSX_ARCHITECTURES=arm64 \
+  -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 \
+  -DCMAKE_PREFIX_PATH=/path/to/Qt/5.15.2/ios \
+  -DQt5_DIR=/path/to/Qt/5.15.2/ios/lib/cmake/Qt5
+cmake --build build/native-ios-arm64 \
+  --config Release --target muse_reader_engine
+```
 
-MuseScore 3.6.2 is GPLv2. Any distribution that links this adapter must ship
-the corresponding license and source-offer notices. See `NOTICE-MUSESCORE.md`
-at the project root.
+The legacy `MUSESCORE_LIBRARIES` mode remains available for an externally built
+complete dependency closure, but the mobile product path intentionally uses the
+source build so that headers, compile definitions, resources, Qt configuration,
+and archive architecture cannot drift apart.
+
+MuseScore 3.6.2 is GPLv2. Distribution must include the corresponding license
+and source-offer notices documented in `NOTICE-MUSESCORE.md`.
