@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<museScore version="3.6">
+  <programVersion>3.6.2</programVersion>
+  <Division>480</Division>
+  <tempolist fix="2">
+    <tempo tick="0">2</tempo>
+  </tempolist>
+  <Part>
+    <Staff>
+      <cleflist>
+        <clef tick="0" idx="0" />
+      </cleflist>
+    </Staff>
+    <trackName>Reader demo</trackName>
+  </Part>
+  <Staff id="1">
+    <VBox>
+      <Text subtype="Title">
+        <html-data><html><body><p>MuseReader Demo</p></body></html></html-data>
+      </Text>
+      <Text subtype="Composer">
+        <html-data><html><body><p>MuseReader sample</p></body></html></html-data>
+      </Text>
+    </VBox>
+    <Measure number="1">
+      <Chord><durationType>quarter</durationType><Note><pitch>60</pitch></Note></Chord>
+      <Chord><durationType>quarter</durationType><Note><pitch>64</pitch></Note></Chord>
+      <Chord><durationType>quarter</durationType><Note><pitch>67</pitch></Note></Chord>
+      <Chord><durationType>quarter</durationType><Note><pitch>72</pitch></Note></Chord>
+    </Measure>
+    <Measure number="2">
+      <Chord><durationType>quarter</durationType><Note><pitch>67</pitch></Note></Chord>
+      <Chord><durationType>quarter</durationType><Note><pitch>64</pitch></Note></Chord>
+      <Chord><durationType>quarter</durationType><Note><pitch>60</pitch></Note></Chord>
+      <Rest><durationType>quarter</durationType></Rest>
+    </Measure>
+    <Measure number="3">
+      <Chord><durationType>half</durationType><Note><pitch>62</pitch></Note></Chord>
+      <Chord><durationType>quarter</durationType><Note><pitch>65</pitch></Note></Chord>
+      <Chord><durationType>quarter</durationType><Note><pitch>69</pitch></Note></Chord>
+    </Measure>
+    <Measure number="4">
+      <Chord><durationType>whole</durationType><Note><pitch>67</pitch></Note></Chord>
+    </Measure>
+    <Measure number="5">
+      <Chord><durationType>eighth</durationType><Note><pitch>72</pitch></Note></Chord>
+      <Chord><durationType>eighth</durationType><Note><pitch>71</pitch></Note></Chord>
+      <Chord><durationType>eighth</durationType><Note><pitch>69</pitch></Note></Chord>
+      <Chord><durationType>eighth</durationType><Note><pitch>67</pitch></Note></Chord>
+      <Chord><durationType>half</durationType><Note><pitch>64</pitch></Note></Chord>
+    </Measure>
+    <Measure number="6">
+      <Chord><durationType>quarter</durationType><Note><pitch>60</pitch></Note></Chord>
+      <Chord><durationType>quarter</durationType><Note><pitch>62</pitch></Note></Chord>
+      <Chord><durationType>quarter</durationType><Note><pitch>64</pitch></Note></Chord>
+      <Chord><durationType>quarter</durationType><Note><pitch>65</pitch></Note></Chord>
+    </Measure>
+    <Measure number="7">
+      <Chord><durationType>half</durationType><Note><pitch>67</pitch></Note></Chord>
+      <Rest><durationType>half</durationType></Rest>
+    </Measure>
+    <Measure number="8">
+      <Chord><durationType>whole</durationType><Note><pitch>60</pitch></Note></Chord>
+    </Measure>
+  </Staff>
+</museScore>
