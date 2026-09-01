@@ -11,9 +11,12 @@ val museReaderQt = project.findProperty("museReaderQtDir")?.toString()
     ?: File(museReaderRoot, "build/toolchains/qt/android/5.15.2/android").canonicalPath
 val museReaderQtBaseSource = project.findProperty("museReaderQtBaseSourceDir")?.toString()
     ?: File(museReaderRoot, "build/toolchains/src/qtbase-everywhere-src-5.15.2").canonicalPath
+val museReaderSoundfont = File(museReaderRoot, "assets/sound/MS Basic.sf3").canonicalPath
 val museReaderCmakeArgs = listOf(
     "-DMUSE_READER_BUILD_MUSESCORE_SOURCE=ON",
+    "-DMUSE_READER_WITH_FLUIDSYNTH=ON",
     "-DMUSESCORE_SOURCE_DIR=$museScoreSource",
+    "-DMUSE_READER_SOUNDFONT_PATH=$museReaderSoundfont",
     "-DMUSE_READER_QTBASE_SOURCE_DIR=$museReaderQtBaseSource",
     "-DQt5_DIR=$museReaderQt/lib/cmake/Qt5",
     "-DCMAKE_PREFIX_PATH=$museReaderQt",

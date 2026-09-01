@@ -91,4 +91,79 @@ void main() {
     expect(find.byType(InteractiveViewer), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
+
+  testWidgets('opens a multi-page canvas and responds to a pinch gesture', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(390, 844);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+
+    final tempoMap = TempoMap(
+      division: 480,
+      points: const [TempoPoint(tick: 0, quarterNotesPerSecond: 2)],
+    );
+    final document = ScoreDocument(
+      sourcePath: '/tmp/multi-page.mscx',
+      fileName: 'multi-page.mscx',
+      format: ScoreFormat.mscx,
+      title: 'Multi-page fixture',
+      composer: 'MuseReader',
+      division: 480,
+      tempoMap: tempoMap,
+      measures: const [],
+      events: const [],
+      pages: [
+        for (var index = 0; index < 3; index++)
+          ScorePage(index: index, width: 820, height: 1160, glyphs: const []),
+      ],
+      endTick: 0,
+      backend: 'test',
+    );
+
+    await tester.pumpWidget(MaterialApp(home: ReaderPage(document: document)));
+    await tester.pumpAndSettle();
+
+    expect(find.byType(PageView), findsNothing);
+    expect(
+      find.byKey(const ValueKey('multi-page-score-interactive-viewer')),
+      findsOneWidget,
+    );
+    expect(find.bySemanticsLabel('多页谱面视图，双指缩放'), findsOneWidget);
+    expect(find.bySemanticsLabel('第 1 页'), findsOneWidget);
+    expect(find.bySemanticsLabel('第 2 页'), findsOneWidget);
+    expect(find.bySemanticsLabel('第 3 页'), findsOneWidget);
+
+    final viewerFinder = find.byKey(
+      const ValueKey('multi-page-score-interactive-viewer'),
+    );
+    final viewer = tester.widget<InteractiveViewer>(viewerFinder);
+    final controller = viewer.transformationController!;
+    expect(viewer.panEnabled, isTrue);
+    expect(viewer.scaleEnabled, isTrue);
+    expect(viewer.minScale, 0.8);
+    expect(viewer.maxScale, 4.0);
+    final center = tester.getCenter(viewerFinder);
+    final first = await tester.createGesture();
+    final second = await tester.createGesture();
+    await first.down(center - const Offset(20, 0));
+    await second.down(center + const Offset(20, 0));
+    await tester.pump();
+    await first.moveTo(center - const Offset(70, 0));
+    await second.moveTo(center + const Offset(70, 0));
+    await tester.pump();
+    expect(controller.value.getMaxScaleOnAxis(), greaterThan(1.0));
+    await first.up();
+    await second.up();
+
+    await tester.tap(find.byTooltip('适应页面'));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byTooltip('下一页'));
+    await tester.pumpAndSettle();
+    expect(find.text('3 页中第 2 页'), findsOneWidget);
+  });
 }

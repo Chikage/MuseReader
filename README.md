@@ -23,6 +23,8 @@ MuseReader 是一个 Android/iOS 双端 Flutter 只读谱面阅读器。它支�
 4. `Score::renderMidi(..., expandRepeats=true, ...)` 生成展开反复后的播放事件。
 5. `Score::utick2utime()` 通过原生 `TempoMap` 与 `RepeatList` 生成整数微秒时间。
 
+阅读器默认使用连续多页画布：所有已排版页面按顺序显示在同一视图中，页面之间保留纸张间距；单指拖动可浏览整份谱面，双指手势会围绕手势中心缩放整份谱面（倍率范围 0.8×–4×）。这对应 MuseScore 3.6.2 `ScoreView` 的页面画布和 `QPinchGesture` 行为，而不是在单页 `PageView` 中分别缩放页面。顶部的“适应页面”按钮可恢复默认的适合宽度视图，底部页码按钮会在多页画布中定位到指定页面。
+
 页面图像、音符 `startUs/endUs` 和 `Note::pageBoundingRect()` 均来自同一个已排版的 `MasterScore`。播放指针、拖动、变速、分页与高亮因此共享同一时间源和几何坐标，不经过 Flutter 的二次排版或 tick 估算。
 
 ## 构建与打包

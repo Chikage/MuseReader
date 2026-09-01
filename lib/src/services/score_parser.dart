@@ -447,6 +447,9 @@ class ScoreParser {
                   staff: staffIndex,
                   voice: voice,
                   measure: number,
+                  channel: 0,
+                  program: 0,
+                  bank: 0,
                 ),
               );
             }

@@ -1,5 +1,6 @@
 <RCC>
   <qresource prefix="/">
+    <file alias="sound/MS Basic.sf3">@MUSE_READER_SOUNDFONT_PATH@</file>
     <file alias="fonts/FreeSans.ttf">@MUSESCORE_SOURCE_DIR@/fonts/FreeSans.ttf</file>
     <file alias="fonts/FreeSerif.ttf">@MUSESCORE_SOURCE_DIR@/fonts/FreeSerif.ttf</file>
     <file alias="fonts/FreeSerifBold.ttf">@MUSESCORE_SOURCE_DIR@/fonts/FreeSerifBold.ttf</file>

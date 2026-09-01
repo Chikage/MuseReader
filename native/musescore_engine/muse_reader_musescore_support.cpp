@@ -3,6 +3,7 @@
 #include <QString>
 
 #include "mscore/preferences.h"
+#include "mscore/extension.h"
 
 Q_LOGGING_CATEGORY(undoRedo, "undoRedo", QtCriticalMsg)
 
@@ -36,6 +37,13 @@ QString resourcePath() {
 
 QString sharePath() {
   return QStringLiteral(":/");
+}
+
+QStringList Extension::getDirectoriesByType(const char* /*type*/) {
+  // Extensions are intentionally not part of the mobile reader package.
+  // FluidSynth still calls this helper while discovering optional fonts, so
+  // return an empty list instead of linking the desktop extension manager.
+  return {};
 }
 
 }  // namespace Ms

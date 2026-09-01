@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stddef.h>
+#include <stdint.h>
 
 #if defined(_WIN32)
 #define MUSE_READER_EXPORT __declspec(dllexport)
@@ -32,6 +33,36 @@ MUSE_READER_EXPORT int muse_reader_is_available(void);
 MUSE_READER_EXPORT void muse_reader_free_json(const char* json);
 
 MUSE_READER_EXPORT const char* muse_reader_last_error(void);
+
+/** Returns non-zero when the bundled MuseScore FluidSynth renderer is linked. */
+MUSE_READER_EXPORT int muse_reader_audio_is_available(void);
+
+/** Initializes the bundled FluidSynth renderer and embedded soundfont. */
+MUSE_READER_EXPORT int muse_reader_audio_initialize(void);
+
+/**
+ * Starts rendering a JSON array of note events. The JSON shape is the same
+ * event list returned by muse_reader_open_json().
+ */
+MUSE_READER_EXPORT int muse_reader_audio_start_json(
+    const char* events_json,
+    int64_t position_us,
+    double speed);
+
+/** Renders interleaved stereo float PCM and returns the number of frames. */
+MUSE_READER_EXPORT size_t muse_reader_audio_render(
+    float* stereo_interleaved,
+    size_t frames);
+
+/** Returns non-zero while a started stream still has audio or release tails. */
+MUSE_READER_EXPORT int muse_reader_audio_is_active(void);
+
+MUSE_READER_EXPORT void muse_reader_audio_stop(void);
+
+/** The native renderer's fixed output sample rate. */
+MUSE_READER_EXPORT int muse_reader_audio_sample_rate(void);
+
+MUSE_READER_EXPORT const char* muse_reader_audio_last_error(void);
 
 #ifdef __cplusplus
 }

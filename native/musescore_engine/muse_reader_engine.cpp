@@ -102,6 +102,13 @@ bool verify_render_resources() {
       return false;
     }
   }
+#if defined(MUSE_READER_WITH_FLUIDSYNTH)
+  if (!QFile::exists(QStringLiteral(":/sound/MS Basic.sf3"))) {
+    set_error(QStringLiteral(
+        "Missing MuseScore playback resource: MS Basic.sf3"));
+    return false;
+  }
+#endif
   return true;
 }
 
@@ -263,6 +270,9 @@ RenderedPage render_page(Ms::MasterScore* score, int page_index) {
 
 struct PendingNote {
   int tick;
+  int channel;
+  int program;
+  int bank;
   int pitch;
   int velocity;
   int staff;
@@ -285,6 +295,9 @@ QJsonObject note_json(
   result.insert("endUs", qRound64(end_time * 1000000.0));
   result.insert("pitch", note.pitch);
   result.insert("velocity", note.velocity);
+  result.insert("channel", note.channel);
+  result.insert("program", note.program);
+  result.insert("bank", note.bank);
   result.insert("staff", note.staff);
   result.insert("voice", note.voice);
   result.insert("measure", note.measure);
@@ -374,6 +387,8 @@ QJsonObject open_with_musescore(const char* utf8_path) {
   score.renderMidi(&midi_events, false, true, Ms::defaultState);
   using NoteKey = std::pair<int, int>;
   std::map<NoteKey, std::deque<PendingNote>> active;
+  std::map<int, int> programs;
+  std::map<int, int> banks;
   QJsonArray events;
   int end_tick = score.repeatList().ticks();
   if (end_tick <= 0 && score.lastMeasure()) {
@@ -383,6 +398,22 @@ QJsonObject open_with_musescore(const char* utf8_path) {
     const int tick = item.first;
     const Ms::NPlayEvent& event = item.second;
     end_tick = qMax(end_tick, tick);
+    if (event.type() == Ms::ME_CONTROLLER) {
+      const int channel = event.channel();
+      const int value = qBound(0, event.value(), 127);
+      if (event.controller() == Ms::CTRL_HBANK) {
+        banks[channel] = (banks[channel] & 0x7f) | (value << 7);
+        continue;
+      }
+      if (event.controller() == Ms::CTRL_LBANK) {
+        banks[channel] = (banks[channel] & 0x3f80) | value;
+        continue;
+      }
+      if (event.controller() == Ms::CTRL_PROGRAM) {
+        programs[channel] = value;
+        continue;
+      }
+    }
     const int pitch = event.pitch();
     const NoteKey key(event.channel(), pitch);
     if (event.type() == Ms::ME_NOTEON && event.velo() > 0) {
@@ -406,7 +437,16 @@ QJsonObject open_with_musescore(const char* utf8_path) {
         }
       }
       active[key].push_back(
-          {tick, pitch, event.velo(), staff, voice, measure_number, page,
+          {tick,
+           static_cast<int>(event.channel()),
+           programs[event.channel()],
+           banks[event.channel()],
+           pitch,
+           event.velo(),
+           staff,
+           voice,
+           measure_number,
+           page,
            page_rect});
     } else if (event.type() == Ms::ME_NOTEOFF ||
                (event.type() == Ms::ME_NOTEON && event.velo() == 0)) {

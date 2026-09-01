@@ -22,12 +22,14 @@ class MainActivity : FlutterActivity() {
     }
 
     private var pendingFileResult: MethodChannel.Result? = null
-    private lateinit var synth: SimpleScoreSynth
+    private lateinit var fallbackSynth: SimpleScoreSynth
+    private lateinit var fluidSynth: FluidScoreSynth
     private val engineExecutor = Executors.newSingleThreadExecutor()
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
-        synth = SimpleScoreSynth()
+        fallbackSynth = SimpleScoreSynth()
+        fluidSynth = FluidScoreSynth()
         val engineAvailable = NativeMuseScoreEngine.isAvailable()
         val engineReady = engineAvailable && NativeMuseScoreEngine.initialize()
 
@@ -93,11 +95,15 @@ class MainActivity : FlutterActivity() {
                         val events = call.argument<List<Any?>>("events") ?: emptyList()
                         val positionUs = (call.argument<Number>("positionUs") ?: 0).toLong()
                         val speed = (call.argument<Number>("speed") ?: 1.0).toDouble()
-                        synth.start(events, positionUs, speed)
+                        fallbackSynth.stop()
+                        if (!fluidSynth.start(events, positionUs, speed)) {
+                            fallbackSynth.start(events, positionUs, speed)
+                        }
                         result.success(null)
                     }
                     "stopAudio" -> {
-                        synth.stop()
+                        fluidSynth.stop()
+                        fallbackSynth.stop()
                         result.success(null)
                     }
                     else -> result.notImplemented()
@@ -166,7 +172,8 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onDestroy() {
-        if (::synth.isInitialized) synth.stop()
+        if (::fluidSynth.isInitialized) fluidSynth.stop()
+        if (::fallbackSynth.isInitialized) fallbackSynth.stop()
         engineExecutor.shutdownNow()
         super.onDestroy()
     }

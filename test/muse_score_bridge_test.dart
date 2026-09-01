@@ -43,6 +43,9 @@ void main() {
                 'endUs': 500000,
                 'pitch': 60,
                 'velocity': 90,
+                'channel': 9,
+                'program': 56,
+                'bank': 128,
                 'staff': 0,
                 'voice': 2,
                 'measure': 1,
@@ -81,7 +84,13 @@ void main() {
       expect(document.pages.single.imageBytes, isNotEmpty);
       expect(document.events.single.voice, 2);
       expect(document.events.single.measure, 1);
+      expect(document.events.single.channel, 9);
+      expect(document.events.single.program, 56);
+      expect(document.events.single.bank, 128);
       expect(document.events.single.pageRect!.left, 100);
+      expect(document.nativeEvents.single['channel'], 9);
+      expect(document.nativeEvents.single['program'], 56);
+      expect(document.nativeEvents.single['bank'], 128);
     },
   );
 

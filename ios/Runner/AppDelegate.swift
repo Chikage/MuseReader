@@ -7,7 +7,8 @@ import UIKit
 @objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate, UIDocumentPickerDelegate {
   private var pendingFileResult: FlutterResult?
   private var activePicker: UIDocumentPickerViewController?
-  private let synth = SimpleScoreSynth()
+  private let fallbackSynth = SimpleScoreSynth()
+  private let fluidSynth = FluidScoreSynth()
   private let engineQueue = DispatchQueue(label: "com.musereader.musescore-engine")
   private var nativeEngineAvailable = false
   private var nativeEngineReady = false
@@ -86,10 +87,14 @@ import UIKit
         let events = arguments["events"] as? [[String: Any]] ?? []
         let positionUs = (arguments["positionUs"] as? NSNumber)?.int64Value ?? 0
         let speed = (arguments["speed"] as? NSNumber)?.doubleValue ?? 1.0
-        self.synth.start(events: events, positionUs: positionUs, speed: speed)
+        self.fallbackSynth.stop()
+        if !self.fluidSynth.start(events: events, positionUs: positionUs, speed: speed) {
+          self.fallbackSynth.start(events: events, positionUs: positionUs, speed: speed)
+        }
         result(nil)
       case "stopAudio":
-        self.synth.stop()
+        self.fluidSynth.stop()
+        self.fallbackSynth.stop()
         result(nil)
       default:
         result(FlutterMethodNotImplemented)
@@ -181,6 +186,7 @@ import UIKit
   }
 
   deinit {
-    synth.stop()
+    fluidSynth.stop()
+    fallbackSynth.stop()
   }
 }

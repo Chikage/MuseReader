@@ -166,6 +166,9 @@ class PlaybackEvent {
     required this.staff,
     required this.voice,
     required this.measure,
+    this.channel = 0,
+    this.program = 0,
+    this.bank = 0,
     this.startUs,
     this.endUs,
     this.pageIndex,
@@ -180,6 +183,9 @@ class PlaybackEvent {
   final int staff;
   final int voice;
   final int measure;
+  final int channel;
+  final int program;
+  final int bank;
   final int? startUs;
   final int? endUs;
   final int? pageIndex;
@@ -199,6 +205,9 @@ class PlaybackEvent {
     staff: staff,
     voice: voice,
     measure: measure,
+    channel: channel,
+    program: program,
+    bank: bank,
     startUs: startUs,
     endUs: endUs,
     pageIndex: pageIndex ?? this.pageIndex,
@@ -216,6 +225,9 @@ class PlaybackEvent {
     'staff': staff,
     'voice': voice,
     'measure': measure,
+    'channel': channel,
+    'program': program,
+    'bank': bank,
     'page': pageIndex ?? 0,
   };
 }

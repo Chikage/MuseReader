@@ -17,7 +17,7 @@ class ReaderPage extends StatefulWidget {
 
 class _ReaderPageState extends State<ReaderPage> {
   late final PlaybackController _playback;
-  late final PageController _pageController;
+  final _scoreViewportKey = GlobalKey<_MultiPageScoreViewportState>();
   int _visiblePage = 0;
 
   @override
@@ -25,7 +25,6 @@ class _ReaderPageState extends State<ReaderPage> {
     super.initState();
     _playback = PlaybackController(widget.document)
       ..addListener(_onPlaybackChanged);
-    _pageController = PageController();
   }
 
   void _onPlaybackChanged() {
@@ -33,31 +32,24 @@ class _ReaderPageState extends State<ReaderPage> {
     final page = _playback.currentPage;
     if (page != _visiblePage &&
         _playback.isPlaying &&
-        _pageController.hasClients) {
+        widget.document.pages.isNotEmpty) {
       _visiblePage = page;
-      _pageController.animateToPage(
-        page,
-        duration: const Duration(milliseconds: 260),
-        curve: Curves.easeOutCubic,
-      );
+      _scoreViewportKey.currentState?.focusPage(page);
     }
     setState(() {});
   }
 
   @override
   void dispose() {
-    _pageController.dispose();
     _playback.dispose();
     super.dispose();
   }
 
   Future<void> _changePage(int page) async {
-    _visiblePage = page;
-    await _pageController.animateToPage(
-      page,
-      duration: const Duration(milliseconds: 240),
-      curve: Curves.easeOutCubic,
-    );
+    if (widget.document.pages.isEmpty) return;
+    final next = page.clamp(0, widget.document.pages.length - 1).toInt();
+    _visiblePage = next;
+    _scoreViewportKey.currentState?.focusPage(next);
     if (!mounted) return;
     setState(() {});
   }
@@ -80,6 +72,21 @@ class _ReaderPageState extends State<ReaderPage> {
         ),
         actions: [
           Tooltip(
+            message: '多页视图 · 双指缩放',
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 4),
+              child: Icon(
+                Icons.view_quilt_outlined,
+                color: theme.colorScheme.primary,
+              ),
+            ),
+          ),
+          IconButton(
+            onPressed: () => _scoreViewportKey.currentState?.resetView(),
+            icon: const Icon(Icons.fit_screen_outlined),
+            tooltip: '适应页面',
+          ),
+          Tooltip(
             message: '只读阅读',
             child: Padding(
               padding: const EdgeInsets.symmetric(horizontal: 16),
@@ -97,24 +104,14 @@ class _ReaderPageState extends State<ReaderPage> {
           Expanded(
             child: ColoredBox(
               color: theme.colorScheme.surfaceContainerLowest,
-              child: PageView.builder(
-                controller: _pageController,
-                itemCount: widget.document.pages.length,
-                onPageChanged: (page) => setState(() => _visiblePage = page),
-                itemBuilder: (context, index) {
-                  final page = widget.document.pages[index];
-                  final activePageRects = <ScoreRect>[
-                    for (final eventIndex in active)
-                      if (widget.document.events[eventIndex].pageIndex ==
-                              index &&
-                          widget.document.events[eventIndex].pageRect != null)
-                        widget.document.events[eventIndex].pageRect!,
-                  ];
-                  return _PageViewport(
-                    page: page,
-                    activeEventIndexes: active,
-                    activePageRects: activePageRects,
-                  );
+              child: _MultiPageScoreViewport(
+                key: _scoreViewportKey,
+                document: widget.document,
+                activeEventIndexes: active,
+                onPageChanged: (page) {
+                  if (page != _visiblePage && mounted) {
+                    setState(() => _visiblePage = page);
+                  }
                 },
               ),
             ),
@@ -190,77 +187,344 @@ class _ScoreInfoBar extends StatelessWidget {
   }
 }
 
+/// A continuous score canvas.  MuseScore's desktop view keeps the laid-out
+/// pages in one canvas (and offers a two-page zoom preset); doing the same in
+/// Flutter means that the reader opens on a multi-page view instead of a
+/// single-page carousel.  The one [InteractiveViewer] around the whole canvas
+/// is also important: a two-finger gesture can cross the gap between pages and
+/// still scales the score as one document.
+class _MultiPageScoreViewport extends StatefulWidget {
+  const _MultiPageScoreViewport({
+    super.key,
+    required this.document,
+    required this.activeEventIndexes,
+    required this.onPageChanged,
+  });
+
+  final ScoreDocument document;
+  final Set<int> activeEventIndexes;
+  final ValueChanged<int> onPageChanged;
+
+  @override
+  State<_MultiPageScoreViewport> createState() =>
+      _MultiPageScoreViewportState();
+}
+
+class _MultiPageScoreViewportState extends State<_MultiPageScoreViewport>
+    with SingleTickerProviderStateMixin {
+  static const _pageHorizontalInset = 14.0;
+  static const _pageVerticalInset = 18.0;
+  static const _minScale = 0.8;
+  static const _maxScale = 4.0;
+  static const _boundaryMargin = EdgeInsets.all(80);
+
+  late final TransformationController _transformationController;
+  late final AnimationController _animationController;
+  late final CurvedAnimation _easeAnimation;
+  Animation<Matrix4>? _transformAnimation;
+
+  List<double> _pageTops = const [];
+  double _canvasWidth = 0;
+  double _canvasHeight = 0;
+  Size _viewportSize = Size.zero;
+  int? _pendingPage;
+  int _lastReportedPage = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _transformationController = TransformationController()
+      ..addListener(_onTransformationChanged);
+    _animationController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 240),
+    )..addListener(_applyTransformAnimation);
+    _easeAnimation = CurvedAnimation(
+      parent: _animationController,
+      curve: Curves.easeOutCubic,
+    );
+  }
+
+  @override
+  void dispose() {
+    _easeAnimation.dispose();
+    _animationController.dispose();
+    _transformationController
+      ..removeListener(_onTransformationChanged)
+      ..dispose();
+    super.dispose();
+  }
+
+  /// Move a page near the top of the viewport while preserving the current
+  /// zoom level.  Calls made before the first layout are replayed once page
+  /// geometry is known.
+  void focusPage(int page, {bool animate = true}) {
+    if (_pageTops.isEmpty || _viewportSize == Size.zero) {
+      _pendingPage = page;
+      return;
+    }
+    final safePage = page.clamp(0, _pageTops.length - 1).toInt();
+    final matrix = _transformationController.value;
+    final scale = matrix.getMaxScaleOnAxis().clamp(_minScale, _maxScale);
+    final translation = matrix.getTranslation();
+    final targetY = _clampTranslationY(
+      -_pageTops[safePage] * scale + _pageVerticalInset,
+      scale,
+    );
+    final target = matrix.clone()
+      ..setTranslationRaw(translation.x, targetY, translation.z);
+    if (animate) {
+      _animateTo(target);
+    } else {
+      _animationController.stop();
+      _transformationController.value = target;
+    }
+    _reportPage(safePage);
+  }
+
+  /// Restore the default fit-width view.  The canvas width is the viewport
+  /// width, so the identity matrix is the same as the MuseScore page-width
+  /// preset for the mobile reader.
+  void resetView() {
+    _animationController.stop();
+    _transformationController.value = Matrix4.identity();
+    _reportPage(0);
+  }
+
+  void _animateTo(Matrix4 target) {
+    _animationController.stop();
+    _transformAnimation = Matrix4Tween(
+      begin: _transformationController.value.clone(),
+      end: target,
+    ).animate(_easeAnimation);
+    _animationController
+      ..reset()
+      ..forward();
+  }
+
+  void _applyTransformAnimation() {
+    final animation = _transformAnimation;
+    if (animation != null && mounted) {
+      _transformationController.value = animation.value;
+    }
+  }
+
+  void _onInteractionStart(ScaleStartDetails _) {
+    _animationController.stop();
+  }
+
+  void _onInteractionUpdate(ScaleUpdateDetails _) {
+    // InteractiveViewer applies the scale around the gesture focal point
+    // before this callback, matching MuseScore's pinch implementation.
+    _reportPage(_pageForCurrentViewport());
+  }
+
+  void _onTransformationChanged() {
+    // This listener also covers programmatic page jumps and resetView().
+    _reportPage(_pageForCurrentViewport());
+  }
+
+  int _pageForCurrentViewport() {
+    if (_pageTops.isEmpty) return 0;
+    final matrix = _transformationController.value;
+    final scale = matrix.getMaxScaleOnAxis();
+    if (scale <= 0) return _lastReportedPage;
+    final translationY = matrix.getTranslation().y;
+    final sceneTop = (-translationY / scale).clamp(0.0, _canvasHeight);
+    // Use a point a little below the top edge so a page remains selected while
+    // its bottom margin is crossing the viewport.
+    final probe = sceneTop + (_viewportSize.height / scale) * 0.18;
+    var page = 0;
+    for (var index = 1; index < _pageTops.length; index++) {
+      if (_pageTops[index] > probe) break;
+      page = index;
+    }
+    return page;
+  }
+
+  void _reportPage(int page) {
+    if (page == _lastReportedPage) return;
+    _lastReportedPage = page;
+    widget.onPageChanged(page);
+  }
+
+  double _clampTranslationY(double translationY, double scale) {
+    final scaledHeight = _canvasHeight * scale;
+    final minTranslation =
+        _viewportSize.height - scaledHeight - _boundaryMargin.bottom;
+    final maxTranslation = _boundaryMargin.top;
+    // A very short synthetic/test page can be smaller than the viewport. In
+    // that case the two bounds overlap in reverse order; keep it centered
+    // instead of passing an invalid range to num.clamp().
+    if (minTranslation > maxTranslation) {
+      return (minTranslation + maxTranslation) / 2;
+    }
+    return translationY.clamp(minTranslation, maxTranslation).toDouble();
+  }
+
+  ({List<double> tops, double height}) _layoutMetrics(double width) {
+    final pageWidth = math.max(1.0, width - _pageHorizontalInset * 2);
+    final tops = <double>[];
+    var top = 0.0;
+    for (var index = 0; index < widget.document.pages.length; index++) {
+      final page = widget.document.pages[index];
+      final safePageWidth = page.width <= 0 ? 1.0 : page.width;
+      final pageHeight = pageWidth * page.height / safePageWidth;
+      tops.add(top + _pageVerticalInset);
+      top += pageHeight + _pageVerticalInset * 2;
+    }
+    return (tops: tops, height: math.max(top, 1.0));
+  }
+
+  void _updateLayoutMetrics(
+    BoxConstraints constraints,
+    List<double> pageTops,
+    double canvasHeight,
+  ) {
+    final nextViewport = Size(constraints.maxWidth, constraints.maxHeight);
+    final changed =
+        _canvasWidth != constraints.maxWidth ||
+        _canvasHeight != canvasHeight ||
+        _viewportSize != nextViewport ||
+        _pageTops.length != pageTops.length;
+    _canvasWidth = constraints.maxWidth;
+    _canvasHeight = canvasHeight;
+    _viewportSize = nextViewport;
+    _pageTops = pageTops;
+    if (changed && _pendingPage != null) {
+      final page = _pendingPage;
+      _pendingPage = null;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && page != null) focusPage(page, animate: false);
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final metrics = _layoutMetrics(constraints.maxWidth);
+        _updateLayoutMetrics(constraints, metrics.tops, metrics.height);
+        final pageWidth = math.max(
+          1.0,
+          constraints.maxWidth - _pageHorizontalInset * 2,
+        );
+        final pages = <Widget>[
+          for (var index = 0; index < widget.document.pages.length; index++)
+            Padding(
+              padding: const EdgeInsets.symmetric(
+                horizontal: _pageHorizontalInset,
+                vertical: _pageVerticalInset,
+              ),
+              child: _PageViewport(
+                page: widget.document.pages[index],
+                pageNumber: index,
+                width: pageWidth,
+                activeEventIndexes: widget.activeEventIndexes,
+                activePageRects: _activePageRects(index),
+              ),
+            ),
+        ];
+        final canvas = SizedBox(
+          width: constraints.maxWidth,
+          height: metrics.height,
+          child: Column(mainAxisSize: MainAxisSize.min, children: pages),
+        );
+        return Semantics(
+          container: true,
+          label: '多页谱面视图，双指缩放',
+          child: InteractiveViewer(
+            key: const ValueKey('multi-page-score-interactive-viewer'),
+            constrained: false,
+            alignment: Alignment.topLeft,
+            minScale: _minScale,
+            maxScale: _maxScale,
+            panEnabled: true,
+            scaleEnabled: true,
+            boundaryMargin: _boundaryMargin,
+            clipBehavior: Clip.hardEdge,
+            transformationController: _transformationController,
+            onInteractionStart: _onInteractionStart,
+            onInteractionUpdate: _onInteractionUpdate,
+            child: canvas,
+          ),
+        );
+      },
+    );
+  }
+
+  List<ScoreRect> _activePageRects(int pageIndex) => [
+    for (final eventIndex in widget.activeEventIndexes)
+      if (eventIndex >= 0 && eventIndex < widget.document.events.length)
+        if (widget.document.events[eventIndex].pageIndex == pageIndex &&
+            widget.document.events[eventIndex].pageRect != null)
+          widget.document.events[eventIndex].pageRect!,
+  ];
+}
+
 class _PageViewport extends StatelessWidget {
   const _PageViewport({
     required this.page,
+    required this.pageNumber,
+    required this.width,
     required this.activeEventIndexes,
     required this.activePageRects,
   });
 
   final ScorePage page;
+  final int pageNumber;
+  final double width;
   final Set<int> activeEventIndexes;
   final List<ScoreRect> activePageRects;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        final width = math.max(1.0, constraints.maxWidth - 28);
-        final height = width * page.height / page.width;
-        final content = page.imageBytes != null
-            ? Stack(
-                children: [
-                  Image.memory(
-                    page.imageBytes!,
-                    width: width,
-                    height: height,
-                    fit: BoxFit.fill,
-                    filterQuality: FilterQuality.high,
-                    gaplessPlayback: true,
-                  ),
-                  Positioned.fill(
-                    child: IgnorePointer(
-                      child: CustomPaint(
-                        painter: _PlaybackOverlayPainter(
-                          pageWidth: page.width,
-                          pageHeight: page.height,
-                          rects: activePageRects,
-                          color: theme.colorScheme.primary,
-                        ),
-                      ),
+    final safePageWidth = page.width <= 0 ? 1.0 : page.width;
+    final height = math.max(1.0, width * page.height / safePageWidth);
+    final content = page.imageBytes != null
+        ? Stack(
+            children: [
+              Image.memory(
+                page.imageBytes!,
+                width: width,
+                height: height,
+                fit: BoxFit.fill,
+                filterQuality: FilterQuality.high,
+                gaplessPlayback: true,
+              ),
+              Positioned.fill(
+                child: IgnorePointer(
+                  child: CustomPaint(
+                    painter: _PlaybackOverlayPainter(
+                      pageWidth: page.width,
+                      pageHeight: page.height,
+                      rects: activePageRects,
+                      color: theme.colorScheme.primary,
                     ),
                   ),
-                ],
-              )
-            : CustomPaint(
-                size: Size(width, height),
-                painter: ScorePagePainter(
-                  page: page,
-                  activeEventIndexes: activeEventIndexes,
-                  inkColor: theme.colorScheme.onSurface,
-                  accentColor: theme.colorScheme.primary,
                 ),
-              );
-        return Center(
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 18),
-            child: InteractiveViewer(
-              constrained: false,
-              alignment: Alignment.topCenter,
-              minScale: 0.8,
-              maxScale: 4,
-              boundaryMargin: const EdgeInsets.all(80),
-              clipBehavior: Clip.hardEdge,
-              child: Material(
-                elevation: 3,
-                color: Colors.white,
-                child: content,
               ),
+            ],
+          )
+        : CustomPaint(
+            size: Size(width, height),
+            painter: ScorePagePainter(
+              page: page,
+              activeEventIndexes: activeEventIndexes,
+              inkColor: theme.colorScheme.onSurface,
+              accentColor: theme.colorScheme.primary,
             ),
-          ),
-        );
-      },
+          );
+    return Semantics(
+      container: true,
+      label: '第 ${pageNumber + 1} 页',
+      child: Material(
+        elevation: 3,
+        color: Colors.white,
+        child: SizedBox(width: width, height: height, child: content),
+      ),
     );
   }
 }

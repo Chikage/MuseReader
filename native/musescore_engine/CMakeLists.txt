@@ -17,6 +17,11 @@ option(
   "Build the complete iOS reader runtime as an embeddable framework"
   OFF
 )
+option(
+  MUSE_READER_WITH_FLUIDSYNTH
+  "Build the MuseScore FluidSynth renderer and bundled SF3 soundfont"
+  ON
+)
 
 if(MUSE_READER_BUILD_MUSESCORE_SOURCE)
   set(MUSE_READER_WITH_MUSESCORE ON)
@@ -35,6 +40,7 @@ add_library(
   ${MUSE_READER_ENGINE_TARGET}
   ${_muse_reader_library_type}
   muse_reader_engine.cpp
+  muse_reader_audio.cpp
 )
 target_compile_features(${MUSE_READER_ENGINE_TARGET} PUBLIC cxx_std_17)
 set_target_properties(
@@ -121,6 +127,12 @@ if(MUSE_READER_WITH_MUSESCORE)
       ${MUSE_READER_ENGINE_TARGET}
       PRIVATE MUSE_READER_BUILD_MUSESCORE_SOURCE=1
     )
+    if(MUSE_READER_WITH_FLUIDSYNTH)
+      target_compile_definitions(
+        ${MUSE_READER_ENGINE_TARGET}
+        PRIVATE MUSE_READER_WITH_FLUIDSYNTH=1
+      )
+    endif()
     set(MUSESCORE_NAME_VERSION "MuseScore 3")
     set(MUSESCORE_VERSION_FULL "3.6.2")
     set(MUSESCORE_VERSION_LABEL "Release")
@@ -135,7 +147,18 @@ if(MUSE_READER_WITH_MUSESCORE)
     set(BUILD_TELEMETRY_MODULE OFF)
     set(ZERBERUS OFF)
     set(OSC OFF)
-    set(SOUNDFONT3 OFF)
+    set(MUSE_READER_SOUNDFONT_PATH
+        "${CMAKE_CURRENT_LIST_DIR}/../../assets/sound/MS Basic.sf3"
+        CACHE FILEPATH "MuseScore SF3 resource embedded in the engine")
+    if(NOT EXISTS "${MUSE_READER_SOUNDFONT_PATH}")
+      message(FATAL_ERROR
+        "MuseScore soundfont not found: ${MUSE_READER_SOUNDFONT_PATH}")
+    endif()
+    if(MUSE_READER_WITH_FLUIDSYNTH)
+      set(SOUNDFONT3 ON)
+    else()
+      set(SOUNDFONT3 OFF)
+    endif()
 
     configure_file(
       "${MUSESCORE_SOURCE_DIR}/build/config.h.in"
@@ -227,6 +250,31 @@ if(MUSE_READER_WITH_MUSESCORE)
       "${CMAKE_CURRENT_SOURCE_DIR}/muse_reader_musescore_support.cpp"
       ${MUSE_READER_RESOURCE_SOURCES}
     )
+    if(MUSE_READER_WITH_FLUIDSYNTH)
+      target_sources(${MUSE_READER_ENGINE_TARGET} PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/fluid/fluid.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/fluid/chan.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/fluid/conv.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/fluid/dsp.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/fluid/fluid_headless.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/fluid/gen.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/fluid/mod.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/fluid/sfont.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/fluid/sfont3.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/fluid/voice.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb_vorbis.c"
+      )
+      # The target supplies a forced C++ Qt include for MuseScore sources.
+      # stb_vorbis is C-compatible, so compiling it as C++ keeps the same
+      # include boundary while retaining its C ABI declarations.
+      set_source_files_properties(
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb_vorbis.c"
+        PROPERTIES LANGUAGE CXX COMPILE_DEFINITIONS STB_VORBIS_NO_STDIO=1
+      )
+      target_include_directories(${MUSE_READER_ENGINE_TARGET} PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/fluid"
+      )
+    endif()
     target_compile_options(${MUSE_READER_ENGINE_TARGET} PRIVATE
       "-include" "${CMAKE_CURRENT_SOURCE_DIR}/mobile_all.h"
     )

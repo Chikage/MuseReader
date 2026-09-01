@@ -18,6 +18,27 @@ The JSON response contains rendered pages, integer-microsecond event times, and
 `Note::pageBoundingRect()` coordinates from the same laid-out `MasterScore`.
 Flutter therefore does not reconstruct engraving geometry or playback timing.
 
+## Bundled playback
+
+The mobile source build also vendors the MuseScore FluidSynth fork from
+`audio/midi/fluid`. `MUSE_READER_WITH_FLUIDSYNTH` is enabled by default for the
+product build. The CMake resource file embeds the MuseScore 3.6.2 default
+`assets/sound/MS Basic.sf3` as `:/sound/MS Basic.sf3`; the soundfont is not
+copied into the Flutter asset bundle a second time. SF3 Ogg
+packets are decoded in memory by the bundled `stb_vorbis` implementation.
+
+`muse_reader_audio.cpp` converts the native note-event JSON into FluidSynth
+program/note events and exposes a small pull-render API in
+`muse_reader_engine.h`. Android feeds that API to a stereo `AudioTrack`, while
+iOS feeds it to an `AVAudioSourceNode`. Both platforms retain the existing
+simple oscillator as a fallback for development builds whose native library
+does not contain the optional audio symbols.
+
+The selected soundfont is MuseScore's `MS Basic.sf3` (MuseScore_General_HQ
+v0.2). Its license, readme and changelog are kept beside the binary in
+`assets/sound/`; the inherited FluidR3Mono attribution is included there as
+well.
+
 ## Source build
 
 `MUSE_READER_BUILD_MUSESCORE_SOURCE=ON` adds the upstream `libmscore`, qzip and

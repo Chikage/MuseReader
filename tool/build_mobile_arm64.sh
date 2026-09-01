@@ -20,6 +20,8 @@ QT_IOS_ROOT="${TOOLCHAIN_DIR}/qt/ios/${QT_VERSION}/ios"
 QTBASE_SOURCE_ROOT="${TOOLCHAIN_DIR}/src/qtbase-everywhere-src-${QT_VERSION}"
 IOS_NATIVE_BUILD_DIR="${BUILD_ROOT}/native-ios-arm64"
 RELEASE_DIR="${BUILD_ROOT}/releases"
+SOUNDFONT_PATH="${PROJECT_ROOT}/assets/sound/MS Basic.sf3"
+SOUNDFONT_SHA256="5ea2375e8bd7d8e71def1036978c1621e85b66934169b6a2744b27b9b3c2d99c"
 
 ANDROID_QTBASE_ARCHIVE="${DOWNLOAD_DIR}/android-qtbase.7z"
 ANDROID_QTSVG_ARCHIVE="${DOWNLOAD_DIR}/android-qtsvg.7z"
@@ -223,6 +225,8 @@ build_ios() {
     -G Xcode \
     -DMUSE_READER_BUILD_MUSESCORE_SOURCE=ON \
     -DMUSE_READER_BUILD_IOS_FRAMEWORK=ON \
+    -DMUSE_READER_WITH_FLUIDSYNTH=ON \
+    -DMUSE_READER_SOUNDFONT_PATH="${SOUNDFONT_PATH}" \
     -DMUSESCORE_SOURCE_DIR="${MUSESCORE_SOURCE_DIR}" \
     -DCMAKE_SYSTEM_NAME=iOS \
     -DCMAKE_OSX_SYSROOT=iphoneos \
@@ -336,6 +340,19 @@ verify_ios() {
     die "MuseReaderEngine does not export muse_reader_open_json"
   grep -q '_muse_reader_free_json' <<<"${symbols}" ||
     die "MuseReaderEngine does not export muse_reader_free_json"
+  for symbol in \
+    muse_reader_audio_is_available \
+    muse_reader_audio_initialize \
+    muse_reader_audio_start_json \
+    muse_reader_audio_render \
+    muse_reader_audio_is_active \
+    muse_reader_audio_stop \
+    muse_reader_audio_sample_rate \
+    muse_reader_audio_last_error
+  do
+    grep -q "_${symbol}" <<<"${symbols}" ||
+      die "MuseReaderEngine does not export ${symbol}"
+  done
   rm -rf "${audit_dir}"
   log "Verified iOS package: iphoneos/arm64 and complete Mach-O dependency closure"
 }
@@ -357,6 +374,9 @@ case "${TARGET}" in
     require_command unzip
     [[ -f "${MUSESCORE_SOURCE_DIR}/libmscore/CMakeLists.txt" ]] ||
       die "MuseScore 3.6.2 source not found at ${MUSESCORE_SOURCE_DIR}"
+    [[ -f "${SOUNDFONT_PATH}" ]] ||
+      die "MuseScore soundfont not found at ${SOUNDFONT_PATH}"
+    verify_checksum 256 "${SOUNDFONT_SHA256}" "${SOUNDFONT_PATH}"
     (
       cd "${PROJECT_ROOT}"
       flutter pub get
