@@ -1,4 +1,4 @@
-package com.musereader.muse_reader
+package icu.ringona.musereader
 
 import android.app.Activity
 import android.content.Intent

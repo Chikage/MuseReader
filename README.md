@@ -85,10 +85,12 @@ flutter test
 
 应用图标迁移自 MuseScore 3.6.2 的
 `assets/musescore-icon-round.svg`，项目内的源文件为
-`assets/branding/muse_reader_icon.svg`。平台 PNG 由配套的 macOS 渲染器
-生成；调整图标时同步更新 SVG 及 Android 自适应图标的前景矢量，然后运行
-`swift tool/generate_app_icons.swift`，即可重新生成 Android 各密度图标和
-iOS AppIcon 资源。
+`assets/branding/muse_reader_icon.svg`。源图标采用不透明的全幅渐变背景，
+由 iOS/Android 在运行时应用原生圆角或形状遮罩，避免透明角落显示黑边；
+Android 自适应前景另留出安全区边距。平台 PNG 由配套的 macOS 渲染器生成；
+调整图标时同步更新 SVG 及 Android 自适应图标的前景矢量，然后运行
+`swift tool/generate_app_icons.swift`，
+即可重新生成 Android 各密度图标和 iOS AppIcon 资源。
 
 脚本的 `verify` 模式还会检查 APK 只含 `arm64-v8a`、所需 Qt/NDK 运行库均已打包、iOS Runner/Flutter/App/原生 Framework 都只含 arm64，并确认 C ABI 导出符号存在。
 
@@ -98,7 +100,7 @@ iOS AppIcon 资源。
 - [lib/src/services/muse_score_bridge.dart](lib/src/services/muse_score_bridge.dart)：原生 JSON 到 Flutter 谱面模型的映射。
 - [lib/src/playback/playback_controller.dart](lib/src/playback/playback_controller.dart)：微秒时间线、拖动、变速和高亮状态。
 - [lib/src/ui/reader_page.dart](lib/src/ui/reader_page.dart)：只读阅读界面。
-- [android/app/src/main/kotlin/com/musereader/muse_reader/MainActivity.kt](android/app/src/main/kotlin/com/musereader/muse_reader/MainActivity.kt)：Android 文件选择、JNI 通道和音频调度。
+- [android/app/src/main/kotlin/icu/ringona/musereader/MainActivity.kt](android/app/src/main/kotlin/icu/ringona/musereader/MainActivity.kt)：Android 文件选择、JNI 通道和音频调度。
 - [ios/Runner/AppDelegate.swift](ios/Runner/AppDelegate.swift)：iOS 文件选择、C ABI 通道和音频调度。
 
 附件源码中的说明文件属于 MuseScore 自身，不是 MuseReader 的产品需求。本项目只采用实现只读加载、原生排版和播放时间线所需的代码，不引入编辑器功能。

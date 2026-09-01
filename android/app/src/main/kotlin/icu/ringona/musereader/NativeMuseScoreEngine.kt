@@ -1,4 +1,4 @@
-package com.musereader.muse_reader
+package icu.ringona.musereader
 
 /** JNI boundary for the packaged MuseScore 3.6.2 reader core. */
 object NativeMuseScoreEngine {

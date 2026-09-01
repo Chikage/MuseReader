@@ -7,21 +7,21 @@
 #include "muse_reader_engine.h"
 
 extern "C" JNIEXPORT jboolean JNICALL
-Java_com_musereader_muse_1reader_NativeMuseScoreEngine_initializeNative(
+Java_icu_ringona_musereader_NativeMuseScoreEngine_initializeNative(
     JNIEnv* /* env */,
     jclass /* clazz */) {
   return muse_reader_initialize() ? JNI_TRUE : JNI_FALSE;
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
-Java_com_musereader_muse_1reader_NativeMuseScoreEngine_isAvailableNative(
+Java_icu_ringona_musereader_NativeMuseScoreEngine_isAvailableNative(
     JNIEnv* /* env */,
     jclass /* clazz */) {
   return muse_reader_is_available() ? JNI_TRUE : JNI_FALSE;
 }
 
 extern "C" JNIEXPORT jstring JNICALL
-Java_com_musereader_muse_1reader_NativeMuseScoreEngine_openJsonNative(
+Java_icu_ringona_musereader_NativeMuseScoreEngine_openJsonNative(
     JNIEnv* env,
     jclass /* clazz */,
     jstring path) {
@@ -39,7 +39,7 @@ Java_com_musereader_muse_1reader_NativeMuseScoreEngine_openJsonNative(
 }
 
 extern "C" JNIEXPORT jstring JNICALL
-Java_com_musereader_muse_1reader_NativeMuseScoreEngine_lastErrorNative(
+Java_icu_ringona_musereader_NativeMuseScoreEngine_lastErrorNative(
     JNIEnv* env,
     jclass /* clazz */) {
   const char* error = muse_reader_last_error();
@@ -48,21 +48,21 @@ Java_com_musereader_muse_1reader_NativeMuseScoreEngine_lastErrorNative(
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
-Java_com_musereader_muse_1reader_NativeMuseScoreEngine_audioIsAvailableNative(
+Java_icu_ringona_musereader_NativeMuseScoreEngine_audioIsAvailableNative(
     JNIEnv* /* env */,
     jclass /* clazz */) {
   return muse_reader_audio_is_available() ? JNI_TRUE : JNI_FALSE;
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
-Java_com_musereader_muse_1reader_NativeMuseScoreEngine_audioInitializeNative(
+Java_icu_ringona_musereader_NativeMuseScoreEngine_audioInitializeNative(
     JNIEnv* /* env */,
     jclass /* clazz */) {
   return muse_reader_audio_initialize() ? JNI_TRUE : JNI_FALSE;
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
-Java_com_musereader_muse_1reader_NativeMuseScoreEngine_audioStartNative(
+Java_icu_ringona_musereader_NativeMuseScoreEngine_audioStartNative(
     JNIEnv* env,
     jclass /* clazz */,
     jstring events_json,
@@ -78,7 +78,7 @@ Java_com_musereader_muse_1reader_NativeMuseScoreEngine_audioStartNative(
 }
 
 extern "C" JNIEXPORT jint JNICALL
-Java_com_musereader_muse_1reader_NativeMuseScoreEngine_audioRenderNative(
+Java_icu_ringona_musereader_NativeMuseScoreEngine_audioRenderNative(
     JNIEnv* env,
     jclass /* clazz */,
     jfloatArray output) {
@@ -95,28 +95,28 @@ Java_com_musereader_muse_1reader_NativeMuseScoreEngine_audioRenderNative(
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
-Java_com_musereader_muse_1reader_NativeMuseScoreEngine_audioIsActiveNative(
+Java_icu_ringona_musereader_NativeMuseScoreEngine_audioIsActiveNative(
     JNIEnv* /* env */,
     jclass /* clazz */) {
   return muse_reader_audio_is_active() ? JNI_TRUE : JNI_FALSE;
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_musereader_muse_1reader_NativeMuseScoreEngine_audioStopNative(
+Java_icu_ringona_musereader_NativeMuseScoreEngine_audioStopNative(
     JNIEnv* /* env */,
     jclass /* clazz */) {
   muse_reader_audio_stop();
 }
 
 extern "C" JNIEXPORT jint JNICALL
-Java_com_musereader_muse_1reader_NativeMuseScoreEngine_audioSampleRateNative(
+Java_icu_ringona_musereader_NativeMuseScoreEngine_audioSampleRateNative(
     JNIEnv* /* env */,
     jclass /* clazz */) {
   return muse_reader_audio_sample_rate();
 }
 
 extern "C" JNIEXPORT jstring JNICALL
-Java_com_musereader_muse_1reader_NativeMuseScoreEngine_audioLastErrorNative(
+Java_icu_ringona_musereader_NativeMuseScoreEngine_audioLastErrorNative(
     JNIEnv* env,
     jclass /* clazz */) {
   const char* error = muse_reader_audio_last_error();

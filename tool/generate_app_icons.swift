@@ -3,8 +3,12 @@
 // Rasterize the bundled MuseScore mark into every launcher/AppIcon size.
 // The renderer intentionally uses AppKit's SVG support so the checked-in
 // vector is the source of truth for all raster platform resources. Android's
-// adaptive foreground is a matching vector mirror in res/drawable and should
-// be updated alongside the SVG if the mark's geometry changes.
+// adaptive foreground is a matching, safe-zone-inset vector mirror in
+// res/drawable and should be updated alongside the SVG if the mark's geometry
+// changes. App icons are
+// exported as opaque RGB PNGs so transparent pixels cannot become black on a
+// launcher background (and iOS App Store validation does not see an alpha
+// channel).
 
 import AppKit
 import CoreGraphics
@@ -13,6 +17,15 @@ import ImageIO
 import UniformTypeIdentifiers
 
 private let sourceRelativePath = "assets/branding/muse_reader_icon.svg"
+
+// Used only as a defensive underlay if a future source edit leaves a pixel
+// transparent. The current SVG intentionally has a full-bleed gradient.
+private let fallbackBackgroundColor = CGColor(
+    red: 33.0 / 255.0,
+    green: 123.0 / 255.0,
+    blue: 183.0 / 255.0,
+    alpha: 1.0
+)
 
 private let iconSizes: [(String, Int)] = [
     // Android legacy launcher icons (mdpi through xxxhdpi).
@@ -98,13 +111,15 @@ private func resizedImage(_ source: CGImage, size: Int) throws -> CGImage {
         bitsPerComponent: 8,
         bytesPerRow: size * 4,
         space: CGColorSpaceCreateDeviceRGB(),
-        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
     ) else {
         throw IconError.contextCreation(size)
     }
 
     context.interpolationQuality = .high
     context.setShouldAntialias(true)
+    context.setFillColor(fallbackBackgroundColor)
+    context.fill(CGRect(x: 0, y: 0, width: size, height: size))
     context.draw(
         source,
         in: CGRect(x: 0, y: 0, width: size, height: size)
