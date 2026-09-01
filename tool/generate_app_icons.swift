@@ -18,6 +18,12 @@ import UniformTypeIdentifiers
 
 private let sourceRelativePath = "assets/branding/muse_reader_icon.svg"
 
+// Android uses a little more breathing room than iOS around the foreground
+// mark. Keep this value in sync with ic_launcher_foreground.xml so adaptive
+// and pre-adaptive Android launchers present the same logo size.
+private let androidMarkScale = 0.82
+private let markGroupToken = "<g id=\"mark\">"
+
 // Used only as a defensive underlay if a future source edit leaves a pixel
 // transparent. The current SVG intentionally has a full-bleed gradient.
 private let fallbackBackgroundColor = CGColor(
@@ -83,13 +89,45 @@ private enum IconError: LocalizedError {
     }
 }
 
-private func loadSourceImage(root: String) throws -> CGImage {
+private func loadSourceImage(root: String, markScale: Double? = nil) throws -> CGImage {
     let path = URL(fileURLWithPath: root)
         .appendingPathComponent(sourceRelativePath)
         .path
-    guard FileManager.default.fileExists(atPath: path),
-          let image = NSImage(contentsOfFile: path) else {
+    guard FileManager.default.fileExists(atPath: path) else {
         throw IconError.missingSource(path)
+    }
+
+    let image: NSImage
+    if let markScale {
+        // Keep one canonical SVG and derive the Android-safe variant in memory
+        // rather than maintaining a second copy of the long MuseScore paths.
+        guard let source = try? String(contentsOfFile: path, encoding: .utf8),
+              source.contains(markGroupToken) else {
+            throw IconError.invalidSource
+        }
+
+        let offset = (1.0 - markScale) * 512.0
+        let replacement = String(
+            format: "  <g id=\"mark\" transform=\"translate(%.2f %.2f) scale(%.2f)\">",
+            locale: Locale(identifier: "en_US_POSIX"),
+            offset,
+            offset,
+            markScale
+        )
+        let androidSVG = source.replacingOccurrences(
+            of: markGroupToken,
+            with: replacement
+        )
+        guard let data = androidSVG.data(using: .utf8),
+              let loadedImage = NSImage(data: data) else {
+            throw IconError.invalidSource
+        }
+        image = loadedImage
+    } else {
+        guard let loadedImage = NSImage(contentsOfFile: path) else {
+            throw IconError.invalidSource
+        }
+        image = loadedImage
     }
 
     var proposedRect = NSRect(origin: .zero, size: image.size)
@@ -156,11 +194,13 @@ let root = CommandLine.arguments.count > 1
 
 do {
     let source = try loadSourceImage(root: root)
+    let androidSource = try loadSourceImage(root: root, markScale: androidMarkScale)
     for (relativePath, size) in iconSizes {
         let output = URL(fileURLWithPath: root)
             .appendingPathComponent(relativePath)
             .path
-        try writePNG(try resizedImage(source, size: size), to: output)
+        let variant = relativePath.hasPrefix("android/") ? androidSource : source
+        try writePNG(try resizedImage(variant, size: size), to: output)
     }
     print("Generated MuseScore app icons in \(root)")
 } catch {

@@ -4,6 +4,7 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
+import android.os.Process
 import kotlin.math.PI
 import kotlin.math.max
 import kotlin.math.min
@@ -18,6 +19,9 @@ class SimpleScoreSynth {
     private var track: AudioTrack? = null
     private var worker: Thread? = null
     private var generation = 0
+    private var basePositionUs = 0L
+    private var playbackSpeed = 1.0
+    private var lastPositionUs = 0L
 
     fun start(rawEvents: List<Any?>, positionUs: Long, speed: Double) {
         val events = rawEvents.mapNotNull { raw ->
@@ -63,11 +67,52 @@ class SimpleScoreSynth {
             track = audio
             generation += 1
             localGeneration = generation
+            basePositionUs = positionUs.coerceAtLeast(0L)
+            playbackSpeed = if (speed.isFinite()) speed.coerceAtLeast(0.0) else 1.0
+            lastPositionUs = basePositionUs
         }
         worker = Thread {
             val buffer = ShortArray(1024)
             var frame = 0L
             try {
+                try {
+                    Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
+                } catch (_: SecurityException) {
+                    // Keep playback working on vendor builds that reject the
+                    // priority hint.
+                }
+
+                // Prime AudioTrack while paused.  Starting it before the
+                // first oscillator block is ready causes an immediate
+                // underrun on slower AVDs.
+                val capacityFrames = try {
+                    audio.bufferSizeInFrames
+                } catch (_: IllegalStateException) {
+                    buffer.size * 3
+                }
+                val prebufferFrames = capacityFrames.coerceIn(
+                    buffer.size,
+                    buffer.size * 3,
+                )
+                var bufferedFrames = 0
+                while (bufferedFrames < prebufferFrames && isCurrent(localGeneration)) {
+                    var hasSound = false
+                    for (index in buffer.indices) {
+                        val timeUs = positionUs +
+                            (frame + index) * 1_000_000.0 / sampleRate * speed
+                        val sample = sampleAt(events, timeUs)
+                        buffer[index] = (sample * Short.MAX_VALUE).toInt()
+                            .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
+                            .toShort()
+                        if (sample != 0.0) hasSound = true
+                    }
+                    val written = audio.write(buffer, 0, buffer.size)
+                    if (written <= 0) break
+                    frame += buffer.size
+                    bufferedFrames += written
+                    if (written < buffer.size) break
+                }
+                if (!isCurrent(localGeneration) || bufferedFrames <= 0) return@Thread
                 audio.play()
                 while (isCurrent(localGeneration)) {
                     var hasSound = false
@@ -106,6 +151,32 @@ class SimpleScoreSynth {
         }
     }
 
+    /** Returns the position currently presented by AudioTrack, if running. */
+    fun positionUs(): Long? {
+        val snapshot = synchronized(lock) {
+            val current = track ?: return@synchronized null
+            TrackSnapshot(
+                audio = current,
+                basePositionUs = basePositionUs,
+                speed = playbackSpeed,
+                lastPositionUs = lastPositionUs,
+            )
+        } ?: return null
+
+        val position = AudioTrackClock.positionUs(
+            audio = snapshot.audio,
+            basePositionUs = snapshot.basePositionUs,
+            speed = snapshot.speed,
+            sampleRate = sampleRate,
+            lastPositionUs = snapshot.lastPositionUs,
+        )
+        return synchronized(lock) {
+            if (track !== snapshot.audio) return@synchronized null
+            lastPositionUs = maxOf(lastPositionUs, position)
+            lastPositionUs
+        }
+    }
+
     fun stop() {
         synchronized(lock) {
             generation += 1
@@ -115,6 +186,9 @@ class SimpleScoreSynth {
             } catch (_: IllegalStateException) {
             }
             track = null
+            basePositionUs = 0L
+            playbackSpeed = 1.0
+            lastPositionUs = 0L
         }
         worker?.interrupt()
         worker = null
@@ -123,6 +197,13 @@ class SimpleScoreSynth {
     private fun isCurrent(localGeneration: Int): Boolean = synchronized(lock) {
         generation == localGeneration && !Thread.currentThread().isInterrupted
     }
+
+    private data class TrackSnapshot(
+        val audio: AudioTrack,
+        val basePositionUs: Long,
+        val speed: Double,
+        val lastPositionUs: Long,
+    )
 
     private fun sampleAt(events: List<ToneEvent>, timeUs: Double): Double {
         var sum = 0.0

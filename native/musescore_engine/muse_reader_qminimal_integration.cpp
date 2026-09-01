@@ -36,10 +36,10 @@
 **
 ****************************************************************************/
 
-// Based on Qt 5.15.2's minimal QPA integration. Qt's upstream Android path
-// falls back to QPlatformFontDatabase even when FreeType is requested, which
-// cannot register the bundled MuseScore fonts. Keep the upstream behavior on
-// other platforms and select QFreeTypeFontDatabase on Android.
+// Based on Qt 5.15.2's minimal QPA integration. The minimal plugin is used
+// instead of Qt's full Android QPA, so Android's system-font database must be
+// selected explicitly while retaining FreeType application-font support for
+// the bundled MuseScore fonts. Other platforms keep the upstream behavior.
 
 #include "qminimalintegration.h"
 #include "qminimalbackingstore.h"
@@ -50,6 +50,13 @@
 #include <qpa/qwindowsysteminterface.h>
 
 #include <QtFontDatabaseSupport/private/qfreetypefontdatabase_p.h>
+#if defined(Q_OS_ANDROID)
+// The minimal QPA plugin does not use Qt's Android platform integration, so
+// it must provide the Android system-font database itself.  In particular,
+// this database scans /system/fonts (including Noto Sans CJK) and supplies the
+// writing-system metadata Qt needs for per-glyph fallback.
+#include "qandroidplatformfontdatabase.h"
+#endif
 #if defined(Q_OS_WINRT)
 #include <QtFontDatabaseSupport/private/qwinrtfontdatabase_p.h>
 #elif defined(Q_OS_WIN)
@@ -146,9 +153,13 @@ QPlatformFontDatabase* QMinimalIntegration::fontDatabase() const {
       m_fontDatabase = new QWindowsFontDatabase;
     }
 #elif defined(Q_OS_ANDROID)
+    // QFreeTypeFontDatabase's default directory is Qt's installation
+    // directory, which is empty in the bundled Android deployment.  The
+    // Android implementation scans /system/fonts and keeps application-font
+    // registration (used below for MuseScore's SMuFL/text fonts) intact.
     if (m_options & FreeTypeFontDatabase) {
 #if QT_CONFIG(freetype)
-      m_fontDatabase = new QFreeTypeFontDatabase;
+      m_fontDatabase = new QAndroidPlatformFontDatabase;
 #endif
     }
 #elif defined(Q_OS_DARWIN)

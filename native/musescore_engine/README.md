@@ -7,8 +7,12 @@ they do not use the former stub or a desktop MuseScore binary.
 The adapter uses the same source of truth for engraving and playback:
 
 1. `MasterScore::loadMsc()` reads MSCX and MSCZ.
-2. `MasterScore::doLayout()` computes native page geometry.
-3. `Score::print()` paints each page to PNG.
+2. The adapter overrides a score's persisted `line`/`system` layout mode with
+   `LayoutMode::PAGE`, so every opened score is laid out as paper pages.
+3. `MasterScore::doLayout()` computes native page geometry and is configured
+   with MuseScore's
+   `showMeasureNumber`/`measureNumberSystem` styles, then `Score::print()`
+   paints each page (including generated line-start measure numbers) to PNG.
 4. `Score::renderMidi(..., expandRepeats=true, ...)` creates the expanded event
    stream.
 5. `Score::utick2utime()` converts expanded ticks through MuseScore's
@@ -16,9 +20,13 @@ The adapter uses the same source of truth for engraving and playback:
 
 The JSON response contains rendered pages, integer-microsecond event times,
 per-note `Note::tuning` cent offsets, and `Note::pageBoundingRect()` coordinates
-from the same laid-out `MasterScore`. Flutter therefore does not reconstruct
-engraving geometry or playback timing. A tuning value is carried alongside the
-integer MIDI pitch; this preserves independently tuned unisons.
+from the same laid-out `MasterScore`. Each playable event also carries a tiny
+transparent PNG rendered by `Note::draw()` with the MuseScore playback mark;
+Flutter places that bitmap at `noteheadRect`, preserving filled, hollow, and
+custom notehead contours instead of approximating them with an ellipse.
+Flutter therefore does not reconstruct engraving geometry or playback timing.
+A tuning value is carried alongside the integer MIDI pitch; this preserves
+independently tuned unisons.
 
 ## Bundled playback
 
@@ -52,7 +60,12 @@ Qt platform plugin for headless page rendering.
 Android's Gradle build enables this mode automatically and emits only
 `arm64-v8a`. The JNI shared object contains the static MuseScore dependencies;
 Qt 5.15.2 Core, Gui, Widgets, Xml and Svg plus `libc++_shared.so` are packaged as
-APK shared libraries.
+APK shared libraries. The matching `jar/QtAndroid.jar` is packaged as well:
+QtCore's `JNI_OnLoad` resolves `QtNative` even though the Flutter host does not
+run Qt's `QtActivity` deployment path. The bundled qminimal plugin uses Qt's
+Android font database to scan `/system/fonts`, so MuseScore text (including
+Chinese) can fall back to the device's CJK faces while the embedded engraving
+fonts remain registered as application fonts.
 
 iOS builds a dynamic `MuseReaderEngine.framework` for `iphoneos/arm64`. Qt,
 MuseScore, qzip, FreeType, qminimal, and reader resources are linked into that

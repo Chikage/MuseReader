@@ -64,6 +64,11 @@ static void initialize_muse_reader_resources() {
 }
 #endif
 
+#if defined(MUSE_READER_WITH_MUSESCORE) && \
+    defined(MUSE_READER_BUILD_MUSESCORE_SOURCE) && defined(Q_OS_ANDROID)
+extern "C" void muse_reader_qminimal_link_anchor();
+#endif
+
 namespace {
 std::mutex g_engine_mutex;
 std::string g_last_error;
@@ -158,6 +163,12 @@ bool initialize_musescore() {
   static std::unique_ptr<Ms::MuseScoreCore> core;
   static std::unique_ptr<QApplication> qt_application;
   if (initialized) return true;
+#if defined(MUSE_READER_WITH_MUSESCORE) && \
+    defined(MUSE_READER_BUILD_MUSESCORE_SOURCE) && defined(Q_OS_ANDROID)
+  // Keep the static qminimal plugin object reachable from the final JNI
+  // shared object (see muse_reader_qminimal_import.cpp).
+  muse_reader_qminimal_link_anchor();
+#endif
 #if defined(MUSE_READER_BUILD_MUSESCORE_SOURCE)
   initialize_muse_reader_resources();
 #endif
@@ -199,6 +210,13 @@ struct RenderedPage {
   QString base64_png;
   int pixel_width = 0;
   int pixel_height = 0;
+};
+
+struct RenderedNotehead {
+  QString base64_png;
+  // Absolute page coordinates, including the small antialiasing margin used
+  // by the transparent bitmap.  Callers translate this to page-local space.
+  QRectF page_rect;
 };
 
 class RenderStateGuard {
@@ -272,6 +290,62 @@ RenderedPage render_page(Ms::MasterScore* score, int page_index) {
   return {QString::fromLatin1(png.toBase64()), width, height};
 }
 
+RenderedNotehead render_notehead(Ms::MasterScore* score,
+                                 const Ms::Note* note) {
+  if (!score || !note || !note->visible()) return {};
+
+  const QRectF note_box = note->pageBoundingRect().normalized();
+  if (note_box.isEmpty() || !qIsFinite(note_box.left()) ||
+      !qIsFinite(note_box.top()) || !qIsFinite(note_box.width()) ||
+      !qIsFinite(note_box.height())) {
+    return {};
+  }
+
+  // Use the same magnification and painter setup as render_page().  The
+  // extra score-space margin keeps glyph antialiasing from being clipped at
+  // the bitmap edge while preserving the exact note bbox in page space.
+  constexpr double render_dpi = MUSE_READER_RENDER_DPI;
+  const double magnification = render_dpi / Ms::DPI;
+  constexpr qreal padding = 1.0;
+  const QRectF crop = note_box.adjusted(-padding, -padding, padding, padding);
+  const int width = qMax(1, qRound(crop.width() * magnification));
+  const int height = qMax(1, qRound(crop.height() * magnification));
+  QImage image(width, height, QImage::Format_ARGB32_Premultiplied);
+  image.fill(Qt::transparent);
+
+  RenderStateGuard state(score);
+  score->setPrinting(false);
+  Ms::MScore::pdfPrinting = false;
+  Ms::MScore::pixelRatio = 1.0 / magnification;
+
+  const bool old_mark = note->mark();
+  note->setMark(true);
+  QPainter painter(&image);
+  painter.setRenderHint(QPainter::Antialiasing, true);
+  painter.setRenderHint(QPainter::TextAntialiasing, true);
+  painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
+  painter.scale(magnification, magnification);
+  painter.translate(-crop.topLeft());
+  painter.save();
+  painter.translate(note->pagePos());
+  // Note::draw uses MuseScore's cached SMuFL symbol and its own fractional
+  // bbox, so custom, diamond, percussion and hollow heads all share the
+  // exact geometry used by the page rasterization.  Stems are separate
+  // elements and are intentionally not included in this overlay.
+  note->draw(&painter);
+  painter.restore();
+  painter.end();
+  note->setMark(old_mark);
+
+  QByteArray png;
+  QBuffer buffer(&png);
+  if (!buffer.open(QIODevice::WriteOnly) || !image.save(&buffer, "PNG")) {
+    set_error(QStringLiteral("MuseScore failed to encode a playback notehead"));
+    return {};
+  }
+  return {QString::fromLatin1(png.toBase64()), crop};
+}
+
 struct PendingNote {
   int tick;
   int channel;
@@ -282,16 +356,45 @@ struct PendingNote {
   // pitch.  Keep it on the pending note so the JSON interval can be replayed
   // by the bundled FluidSynth voice without collapsing microtonal unisons.
   double tuning = 0.0;
+  // Playback marking changes a Note's colour, not its engraved head shape.
+  // Preserve this bit so Flutter can recolour hollow heads without filling
+  // whole/half/breve noteheads on top of the rasterized page.
+  bool notehead_filled = true;
   int velocity;
   int staff;
   int voice;
   int measure;
   int page;
   QRectF page_rect;
+  QString notehead_image;
+  QRectF notehead_rect;
   QRectF cursor_rect;
   qreal cursor_end_x = 0.0;
   bool has_cursor = false;
 };
+
+bool notehead_is_filled(const Ms::Note* note) {
+  if (!note || !note->chord()) return true;
+
+  // Tablature noteheads are fret strings rather than oval noteheads. They
+  // should remain solid text even when the chord duration is a half note.
+  if (note->staff() && note->staff()->isTabStaff(note->chord()->tick())) {
+    return true;
+  }
+
+  auto head_type = note->headType();
+  if (head_type == Ms::NoteHead::Type::HEAD_AUTO) {
+    head_type = note->chord()->durationType().headType();
+  }
+  switch (head_type) {
+    case Ms::NoteHead::Type::HEAD_WHOLE:
+    case Ms::NoteHead::Type::HEAD_HALF:
+    case Ms::NoteHead::Type::HEAD_BREVIS:
+      return false;
+    default:
+      return true;
+  }
+}
 
 // Geometry copied from ScoreView::moveCursor() in MuseScore 3.6.2.  The
 // cursor is kept as a set of tick intervals because its x coordinate is
@@ -487,6 +590,7 @@ QJsonObject note_json(
   result.insert("endUs", qRound64(end_time * 1000000.0));
   result.insert("pitch", note.pitch);
   result.insert("tuning", Ms::normalizedPlayEventTuning(note.tuning));
+  result.insert("noteheadFilled", note.notehead_filled);
   result.insert("velocity", note.velocity);
   result.insert("channel", note.channel);
   result.insert("program", note.program);
@@ -502,6 +606,15 @@ QJsonObject note_json(
     rect.insert("width", note.page_rect.width());
     rect.insert("height", note.page_rect.height());
     result.insert("rect", rect);
+  }
+  if (!note.notehead_image.isEmpty() && !note.notehead_rect.isEmpty()) {
+    QJsonObject rect;
+    rect.insert("x", note.notehead_rect.x());
+    rect.insert("y", note.notehead_rect.y());
+    rect.insert("width", note.notehead_rect.width());
+    rect.insert("height", note.notehead_rect.height());
+    result.insert("noteheadImage", note.notehead_image);
+    result.insert("noteheadRect", rect);
   }
   if (note.has_cursor && !note.cursor_rect.isEmpty()) {
     QJsonObject cursor;
@@ -526,6 +639,23 @@ QJsonObject open_with_musescore(const char* utf8_path) {
     return {};
   }
 
+  // A score file may persist MuseScore's view mode as
+  // <layoutMode>line</layoutMode> or <layoutMode>system</layoutMode>.  Those
+  // modes deliberately collapse the page list into a panoramic/single-system
+  // layout.  MuseReader always exposes the paper pages as a multi-page
+  // document, so override the file preference before laying the score out.
+  // This mirrors MuseScore's own `switchToPageMode()` path (see
+  // Score::switchToPageMode in 3.6.2).
+  score.setLayoutMode(Ms::LayoutMode::PAGE);
+
+  // Match the reader's line-oriented navigation affordance while keeping the
+  // actual MuseScore MeasureNumber layout/drawing path.  MuseScore's
+  // Measure::layoutMeasureNumber() uses these style flags to place the first
+  // measure number of every system (and the first measure of the score).
+  score.setStyleValue(Ms::Sid::showMeasureNumber, true);
+  score.setStyleValue(Ms::Sid::showMeasureNumberOne, true);
+  score.setStyleValue(Ms::Sid::measureNumberSystem, true);
+  score.setStyleValue(Ms::Sid::measureNumberAllStaves, false);
   // Layout is the source of truth for every page image. No Flutter-side
   // geometry is used when this backend is enabled.
   score.doLayout();
@@ -614,6 +744,9 @@ QJsonObject open_with_musescore(const char* utf8_path) {
   // equal MIDI pitches with different cent offsets are paired correctly.
   using NoteKey = std::tuple<int, int, qint64>;
   std::map<NoteKey, std::deque<PendingNote>> active;
+  // A note can occur more than once in the unrolled MIDI stream (repeats,
+  // tied playback events).  Render its exact glyph once and reuse the PNG.
+  std::map<const Ms::Note*, RenderedNotehead> notehead_cache;
   std::map<int, int> programs;
   std::map<int, int> banks;
   for (const Ms::MidiMapping& mapping : score.midiMapping()) {
@@ -666,14 +799,18 @@ QJsonObject open_with_musescore(const char* utf8_path) {
       int voice = 0;
       int page = 0;
       QRectF page_rect;
+      QString notehead_image;
+      QRectF notehead_rect;
       QRectF cursor_rect;
       qreal cursor_end_x = 0.0;
       bool has_cursor = false;
+      bool notehead_filled = true;
       if (event.note() && event.note()->chord() && event.note()->chord()->measure()) {
         Ms::Measure* measure = event.note()->chord()->measure();
         staff = qMax(0, event.note()->staffIdx());
         voice = event.note()->voice();
         measure_number = measure->no() + 1;
+        notehead_filled = notehead_is_filled(event.note());
         if (measure->system() && measure->system()->page()) {
           Ms::Page* note_page = measure->system()->page();
           page = qMax(0, score.pageIdx(note_page));
@@ -681,6 +818,21 @@ QJsonObject open_with_musescore(const char* utf8_path) {
                           ->pageBoundingRect()
                           .translated(-note_page->abbox().topLeft())
                           .normalized();
+          const Ms::Note* source_note = event.note();
+          auto cached_notehead = notehead_cache.find(source_note);
+          if (cached_notehead == notehead_cache.end()) {
+            cached_notehead =
+                notehead_cache.emplace(source_note,
+                                       render_notehead(&score, source_note))
+                    .first;
+          }
+          if (!cached_notehead->second.base64_png.isEmpty() &&
+              !cached_notehead->second.page_rect.isEmpty()) {
+            notehead_image = cached_notehead->second.base64_png;
+            notehead_rect = cached_notehead->second.page_rect
+                                .translated(-note_page->abbox().topLeft())
+                                .normalized();
+          }
           if (event.note()->chord()->segment()) {
             const int original_tick =
                 event.note()->chord()->segment()->tick().ticks();
@@ -701,12 +853,15 @@ QJsonObject open_with_musescore(const char* utf8_path) {
            banks[event.channel()],
            pitch,
            Ms::normalizedPlayEventTuning(tuning),
+           notehead_filled,
            event.velo(),
            staff,
            voice,
            measure_number,
            page,
            page_rect,
+           notehead_image,
+           notehead_rect,
            cursor_rect,
            cursor_end_x,
            has_cursor});

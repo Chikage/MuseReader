@@ -14,8 +14,9 @@ is the MuseScore 3.6.2 round application mark copied from
 derived from that source. MuseScore and its logo are trademarks of their
 respective owners; this migration does not imply endorsement or affiliation.
 
-The product packages also link Qt 5.15.2 Core, Gui, Widgets, Xml and Svg, and
-compile Qt's minimal platform plugin. Qt's open-source distribution includes
+The product packages also link Qt 5.15.2 Core, Gui, Widgets, Xml and Svg,
+package the matching Qt Android JNI runtime (`QtAndroid.jar`), and compile
+Qt's minimal platform plugin. Qt's open-source distribution includes
 GPL/LGPL license choices and component-specific notices. MuseScore's qzip and
 FreeType dependencies retain their own upstream notices in the supplied source
 tree.

@@ -26,7 +26,11 @@ void main() {
     await tester.tap(find.text('MuseReader Demo'));
     await tester.pumpAndSettle();
 
-    expect(find.text('MuseReader sample'), findsOneWidget);
+    // Composer text is part of the engraved page image, not the transport
+    // metadata row; it should no longer appear as a bottom control label.
+    expect(find.text('MuseReader sample'), findsNothing);
+    expect(find.byTooltip('播放速度'), findsNothing);
+    expect(find.textContaining('小节'), findsNothing);
     expect(tester.takeException(), isNull);
   });
 
@@ -164,6 +168,6 @@ void main() {
 
     await tester.tap(find.byTooltip('下一页'));
     await tester.pumpAndSettle();
-    expect(find.text('3 页中第 2 页'), findsOneWidget);
+    expect(find.text('2/3'), findsOneWidget);
   });
 }

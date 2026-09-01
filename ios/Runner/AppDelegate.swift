@@ -12,6 +12,7 @@ import UIKit
   private let engineQueue = DispatchQueue(label: "com.musereader.musescore-engine")
   private var nativeEngineAvailable = false
   private var nativeEngineReady = false
+  private let importDirectoryName = "muse_reader/imports"
 
   override func application(
     _ application: UIApplication,
@@ -35,6 +36,8 @@ import UIKit
       switch call.method {
       case "pickScoreFile":
         self.presentScorePicker(result: result)
+      case "listImportedScoreFiles":
+        result(self.listImportedScoreFiles())
       default:
         result(FlutterMethodNotImplemented)
       }
@@ -144,18 +147,116 @@ import UIKit
       if accessed { url.stopAccessingSecurityScopedResource() }
     }
     do {
-      let directory = FileManager.default.temporaryDirectory
-        .appendingPathComponent("muse_reader/imports", isDirectory: true)
-      try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+      let directory = persistentImportsDirectory()
       let extensionName = url.pathExtension.isEmpty ? "mscx" : url.pathExtension
-      let target = directory.appendingPathComponent(
-        "\(Int(Date().timeIntervalSince1970 * 1000))_\(url.deletingPathExtension().lastPathComponent).\(extensionName)"
+      let target = uniqueImportTarget(
+        directory: directory,
+        baseName: url.deletingPathExtension().lastPathComponent,
+        extensionName: extensionName
       )
       try FileManager.default.copyItem(at: url, to: target)
       result(target.path)
     } catch {
       result(FlutterError(code: "copy_failed", message: error.localizedDescription, details: nil))
     }
+  }
+
+  private func uniqueImportTarget(
+    directory: URL,
+    baseName: String,
+    extensionName: String
+  ) -> URL {
+    let timestamp = Int(Date().timeIntervalSince1970 * 1000)
+    var target = directory.appendingPathComponent(
+      "\(timestamp)_\(baseName).\(extensionName)"
+    )
+    var suffix = 1
+    let fileManager = FileManager.default
+    while fileManager.fileExists(atPath: target.path) {
+      target = directory.appendingPathComponent(
+        "\(timestamp)_\(suffix)_\(baseName).\(extensionName)"
+      )
+      suffix += 1
+    }
+    return target
+  }
+
+  /// Imported scores live in Application Support so they survive process
+  /// restarts and iOS temporary-directory cleanup. Older builds copied files
+  /// to the temporary directory; migrate those files when the library first
+  /// asks for its persisted imports.
+  private func listImportedScoreFiles() -> [String] {
+    migrateLegacyImports()
+    let fileManager = FileManager.default
+    guard let files = try? fileManager.contentsOfDirectory(
+      at: persistentImportsDirectory(),
+      includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey],
+      options: [.skipsHiddenFiles]
+    ) else {
+      return []
+    }
+    return files
+      .filter {
+        guard isSupportedScoreFile($0.lastPathComponent) else { return false }
+        return (try? $0.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
+      }
+      .sorted { lhs, rhs in
+        let leftDate = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
+          ?? .distantPast
+        let rightDate = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
+          ?? .distantPast
+        if leftDate != rightDate { return leftDate > rightDate }
+        return lhs.lastPathComponent > rhs.lastPathComponent
+      }
+      .map(\.path)
+  }
+
+  private func persistentImportsDirectory() -> URL {
+    let fileManager = FileManager.default
+    let applicationSupport = fileManager.urls(
+      for: .applicationSupportDirectory,
+      in: .userDomainMask
+    )[0]
+    let directory = applicationSupport.appendingPathComponent(importDirectoryName, isDirectory: true)
+    try? fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+    return directory
+  }
+
+  private func migrateLegacyImports() {
+    let fileManager = FileManager.default
+    let legacyDirectory = fileManager.temporaryDirectory
+      .appendingPathComponent(importDirectoryName, isDirectory: true)
+    guard let files = try? fileManager.contentsOfDirectory(
+      at: legacyDirectory,
+      includingPropertiesForKeys: [.isRegularFileKey],
+      options: [.skipsHiddenFiles]
+    ) else {
+      return
+    }
+    let destination = persistentImportsDirectory()
+    for source in files where isSupportedScoreFile(source.lastPathComponent) {
+      guard (try? source.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else {
+        continue
+      }
+      let target = destination.appendingPathComponent(source.lastPathComponent)
+      if fileManager.fileExists(atPath: target.path) { continue }
+      do {
+        try fileManager.moveItem(at: source, to: target)
+      } catch {
+        // A cross-volume move may fail; retain a copy fallback and leave the
+        // legacy file untouched if copying also fails.
+        do {
+          try fileManager.copyItem(at: source, to: target)
+        } catch {
+          try? fileManager.removeItem(at: target)
+        }
+      }
+    }
+  }
+
+  private func isSupportedScoreFile(_ name: String) -> Bool {
+    let extensionName = (name as NSString).pathExtension.lowercased()
+    return extensionName == "mscx" || extensionName == "mscz"
   }
 
   private func nativeDocument(path: String) -> [String: Any]? {

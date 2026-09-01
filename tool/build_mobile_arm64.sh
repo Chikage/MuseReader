@@ -148,6 +148,12 @@ prepare_android_toolchain() {
     "${QT_ANDROID_ROOT}/lib/cmake/Qt5Svg/Qt5SvgConfig.cmake"
   extract_if_missing "${QTBASE_SOURCE_ARCHIVE}" "${TOOLCHAIN_DIR}/src" \
     "${QTBASE_SOURCE_ROOT}/src/plugins/platforms/minimal/main.cpp"
+
+  # The Android Qt shared libraries call into QtNative from JNI_OnLoad. Keep
+  # the matching runtime jar in the toolchain; Gradle packages it explicitly
+  # because this Flutter host does not run androiddeployqt/QtActivity.
+  [[ -f "${QT_ANDROID_ROOT}/jar/QtAndroid.jar" ]] ||
+    die "Qt Android runtime jar not found: ${QT_ANDROID_ROOT}/jar/QtAndroid.jar"
 }
 
 prepare_ios_toolchain() {

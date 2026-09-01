@@ -36,6 +36,17 @@ ScoreDocument _document() {
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
+  test('formats playback time with stable minute, second, and hour widths', () {
+    expect(formatScoreDuration(0), '0:00');
+    expect(formatScoreDuration(9 * 60 * 1000000 + 5 * 1000000), '9:05');
+    expect(formatScoreDuration(10 * 60 * 1000000 + 5 * 1000000), '10:05');
+    expect(
+      formatScoreDuration(1 * 3600 * 1000000 + 2 * 60 * 1000000 + 5 * 1000000),
+      '1:02:05',
+    );
+    expect(formatScoreDuration(-1), '0:00');
+  });
+
   test('shows a cursor after a paused seek and clears it on restart', () async {
     final controller = PlaybackController(_document());
     addTearDown(controller.dispose);

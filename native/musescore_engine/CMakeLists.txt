@@ -310,6 +310,10 @@ if(MUSE_READER_WITH_MUSESCORE)
         "${MUSE_READER_QTBASE_SOURCE_DIR}/src/plugins/platforms/minimal/main.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/muse_reader_qminimal_integration.cpp"
         "${MUSE_READER_QTBASE_SOURCE_DIR}/src/plugins/platforms/minimal/qminimalbackingstore.cpp"
+        # The minimal plugin is used instead of Qt's Android QPA, but its
+        # font database still needs to enumerate Android's /system/fonts so
+        # CJK text can fall back to the device's Noto Sans CJK faces.
+        "${MUSE_READER_QTBASE_SOURCE_DIR}/src/plugins/platforms/android/qandroidplatformfontdatabase.cpp"
       )
       set_target_properties(muse_reader_qminimal PROPERTIES
         AUTOMOC ON
@@ -319,6 +323,7 @@ if(MUSE_READER_WITH_MUSESCORE)
       target_include_directories(muse_reader_qminimal PRIVATE
         "${MUSESCORE_SOURCE_DIR}/thirdparty/freetype/include"
         "${MUSE_READER_QTBASE_SOURCE_DIR}/src/plugins/platforms/minimal"
+        "${MUSE_READER_QTBASE_SOURCE_DIR}/src/plugins/platforms/android"
       )
       target_link_libraries(muse_reader_qminimal PRIVATE
         Qt5::CorePrivate

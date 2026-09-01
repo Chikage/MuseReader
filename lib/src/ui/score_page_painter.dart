@@ -57,6 +57,15 @@ class ScorePagePainter extends CustomPainter {
             inkColor.withValues(alpha: 0.66),
             false,
           );
+        case GlyphKind.measureNumber:
+          _drawText(
+            canvas,
+            glyph.text ?? '',
+            rect,
+            11,
+            inkColor.withValues(alpha: 0.72),
+            false,
+          );
         case GlyphKind.staffLine:
           final linePaint = Paint()
             ..color = inkColor.withValues(alpha: 0.82)

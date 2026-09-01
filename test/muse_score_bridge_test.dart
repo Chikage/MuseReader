@@ -101,6 +101,7 @@ void main() {
                 'endUs': 500000,
                 'pitch': 60,
                 'tuning': 33.3333,
+                'noteheadFilled': false,
                 'velocity': 90,
                 'channel': 31,
                 'program': 56,
@@ -110,6 +111,13 @@ void main() {
                 'measure': 1,
                 'page': 0,
                 'rect': {'x': 100.0, 'y': 200.0, 'width': 20.0, 'height': 16.0},
+                'noteheadImage': base64Encode(const [137, 80, 78, 71]),
+                'noteheadRect': {
+                  'x': 99.0,
+                  'y': 199.0,
+                  'width': 22.0,
+                  'height': 18.0,
+                },
                 'cursor': {
                   'x': 80.0,
                   'y': 180.0,
@@ -150,6 +158,7 @@ void main() {
       expect(document.pages.single.imageBytes, isNotEmpty);
       expect(document.events.single.voice, 2);
       expect(document.events.single.tuning, closeTo(33.3333, 0.000001));
+      expect(document.events.single.noteheadFilled, isFalse);
       expect(document.events.single.measure, 1);
       expect(document.events.single.cursorRect!.left, 80);
       expect(document.events.single.cursorEndX, 180);
@@ -168,12 +177,19 @@ void main() {
       expect(document.events.single.program, 56);
       expect(document.events.single.bank, 128);
       expect(document.events.single.pageRect!.left, 100);
+      expect(document.events.single.noteheadImageBytes, isNotEmpty);
+      expect(document.events.single.noteheadRect!.left, 99);
       expect(document.nativeEvents.single['channel'], 31);
       expect(document.nativeEvents.single['program'], 56);
       expect(document.nativeEvents.single['bank'], 128);
       expect(
         document.nativeEvents.single['tuning'],
         closeTo(33.3333, 0.000001),
+      );
+      expect(document.nativeEvents.single['noteheadFilled'], isFalse);
+      expect(
+        document.nativeEvents.single.containsKey('noteheadImage'),
+        isFalse,
       );
     },
   );

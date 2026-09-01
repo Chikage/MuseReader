@@ -1,6 +1,6 @@
 # MuseReader
 
-MuseReader 是一个 Android/iOS 双端 Flutter 只读谱面阅读器。它支持通过系统文件选择器打开 `MSCX` 和 `MSCZ`，使用 MuseScore 3.6.2 原生排版器生成分页谱面，并按同一份展开反复后的原生时间线播放、定位和高亮音符。产品界面不包含编辑、保存或导出功能。
+MuseReader 是一个 Android/iOS 双端 Flutter 只读谱面阅读器。它支持通过系统文件选择器打开 `MSCX` 和 `MSCZ`，使用 MuseScore 3.6.2 原生排版器生成分页谱面，并按同一份展开反复后的原生时间线播放、定位和高亮音符。导入的谱面会复制到应用私有的持久目录，并在应用重启后自动恢复到谱面库。产品界面不包含编辑、保存或导出功能。
 
 ## 移动端原生状态
 
@@ -8,7 +8,7 @@ MuseReader 是一个 Android/iOS 双端 Flutter 只读谱面阅读器。它支�
 
 | 平台 | 目标 | 原生交付 |
 | --- | --- | --- |
-| Android | `arm64-v8a`，NDK `28.2.13676358` | `libmuse_reader_engine.so` 静态吸收 `libmscore`、qzip、FreeType、qminimal 与资源；APK 同时携带 Qt 5.15.2 Core/Gui/Widgets/Xml/Svg 和 `libc++_shared.so` |
+| Android | `arm64-v8a`，NDK `28.2.13676358` | `libmuse_reader_engine.so` 静态吸收 `libmscore`、qzip、FreeType、qminimal 与资源；APK 同时携带 Qt 5.15.2 Core/Gui/Widgets/Xml/Svg、Qt Android JNI runtime (`QtAndroid.jar`) 和 `libc++_shared.so` |
 | iOS | `iphoneos/arm64`，最低 iOS 13 | `MuseReaderEngine.framework` 静态吸收 Qt 5.15.2、`libmscore`、qzip、FreeType、qminimal 与资源，仅保留 Apple 系统动态依赖 |
 
 `ScoreRepository` 对 Android/iOS 使用 `MUSE_READER_REQUIRE_NATIVE=true` 的 fail-closed 语义，原生核心缺失或初始化失败时会明确报错，不会静默切换到兼容排版。构建脚本仍显式传入该 define，避免发布命令的意图不清晰。Dart 兼容解析器仅保留给非移动端测试和开发诊断。
@@ -51,7 +51,7 @@ MuseScore `<Events>` 的装饰音/分解播放事件也会保留其相对音高�
 ./tool/build_mobile_arm64.sh all
 ```
 
-脚本会从 Qt 官方归档下载并校验 Qt 5.15.2 Android/iOS Core、Gui、Widgets、Xml、Svg 组件和 Android qminimal 所需的 QtBase 源码，然后直接从 MuseScore 3.6.2 源码交叉编译 `libmscore` 及依赖。也可只构建一个平台或只审计已有产物：
+脚本会从 Qt 官方归档下载并校验 Qt 5.15.2 Android/iOS Core、Gui、Widgets、Xml、Svg 组件、Android JNI runtime（`QtAndroid.jar`）和 Android qminimal 所需的 QtBase 源码，然后直接从 MuseScore 3.6.2 源码交叉编译 `libmscore` 及依赖。也可只构建一个平台或只审计已有产物：
 
 ```sh
 ./tool/build_mobile_arm64.sh android

@@ -31,12 +31,59 @@ void main() {
     expect(document.events, hasLength(2));
     expect(document.events.first.startTick, 0);
     expect(document.events.first.endTick, 480);
+    expect(document.events.first.noteheadFilled, isTrue);
     expect(document.events[1].startTick, 480);
+    expect(document.events[1].noteheadFilled, isFalse);
+    final halfNoteGlyph = document.pages
+        .expand((page) => page.glyphs)
+        .firstWhere((glyph) => glyph.eventIndex == 1);
+    expect(halfNoteGlyph.filled, isFalse);
+    final measureNumbers = document.pages
+        .expand((page) => page.glyphs)
+        .where((glyph) => glyph.kind == GlyphKind.measureNumber)
+        .toList();
+    expect(measureNumbers, hasLength(1));
+    expect(measureNumbers.single.text, '1');
     expect(document.tempoMap.bpmAt(0), 120);
     expect(document.tempoMap.tickToUs(480), 500000);
     expect(document.tempoMap.tickToUs(1920), 2000000);
     expect(document.tempoMap.tickToUs(2400), 3000000);
   });
+
+  test(
+    'honours numeric MuseScore notehead overrides in the fallback parser',
+    () {
+      const numericHeadType = '''
+<?xml version="1.0" encoding="UTF-8"?>
+<museScore version="3.6">
+  <Division>480</Division>
+  <Part><Staff /></Part>
+  <Staff id="1">
+    <Measure number="1">
+      <Chord>
+        <durationType>quarter</durationType>
+        <Note><headType>1</headType><pitch>60</pitch></Note>
+      </Chord>
+    </Measure>
+  </Staff>
+</museScore>
+''';
+
+      final document = ScoreParser().parseBytes(
+        utf8.encode(numericHeadType),
+        '/tmp/numeric-head-type.mscx',
+      );
+
+      expect(document.events.single.noteheadFilled, isFalse);
+      expect(
+        document.pages
+            .expand((page) => page.glyphs)
+            .singleWhere((glyph) => glyph.eventIndex == 0)
+            .filled,
+        isFalse,
+      );
+    },
+  );
 
   test('uses a deterministic page and playback mapping', () {
     final document = ScoreParser().parseBytes(

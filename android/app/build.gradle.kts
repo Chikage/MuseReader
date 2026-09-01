@@ -9,6 +9,12 @@ val museScoreSource = project.findProperty("museScoreSourceDir")?.toString()
     ?: File(museReaderRoot.parentFile, "MuseScore-3.6.2").canonicalPath
 val museReaderQt = project.findProperty("museReaderQtDir")?.toString()
     ?: File(museReaderRoot, "build/toolchains/qt/android/5.15.2/android").canonicalPath
+// Qt's Android shared libraries use JNI_OnLoad to bind to the QtNative
+// runtime class. Flutter does not use QtActivity, so androiddeployqt is not
+// involved and the runtime jar must be packaged explicitly. Without it
+// libQt5Core fails its JNI bootstrap with "initJNI failed" before the
+// MuseScore bridge can initialize.
+val museReaderQtAndroidJar = File(museReaderQt, "jar/QtAndroid.jar")
 val museReaderQtBaseSource = project.findProperty("museReaderQtBaseSourceDir")?.toString()
     ?: File(museReaderRoot, "build/toolchains/src/qtbase-everywhere-src-5.15.2").canonicalPath
 val museReaderSoundfont = File(museReaderRoot, "assets/sound/MS Basic.sf3").canonicalPath
@@ -68,6 +74,10 @@ android {
             // TODO: Add your own signing config for the release build.
             // Signing with the debug keys for now, so `flutter run --release` works.
             signingConfig = signingConfigs.getByName("debug")
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
         }
     }
 }
@@ -80,4 +90,8 @@ kotlin {
 
 flutter {
     source = "../.."
+}
+
+dependencies {
+    implementation(files(museReaderQtAndroidJar))
 }

@@ -23,24 +23,57 @@ class _LibraryPageState extends State<LibraryPage> {
   @override
   void initState() {
     super.initState();
-    _loadDemo();
+    _loadLibrary();
   }
 
-  Future<void> _loadDemo() async {
+  Future<void> _loadLibrary() async {
+    final restored = <ScoreDocument>[];
+    String? firstError;
+
+    // Imported files are copied to a persistent platform-owned directory by
+    // the system picker. Re-open them on every app start so the library is
+    // reconstructed after the Flutter process has been recreated.
+    var importedPaths = const <String>[];
+    try {
+      importedPaths = await _picker.listImportedScoreFiles();
+    } catch (error) {
+      firstError = '无法读取已保存谱面：$error';
+    }
+    final seenPaths = <String>{};
+    for (final path in importedPaths) {
+      if (!seenPaths.add(path)) continue;
+      if (!mounted) return;
+      try {
+        final document = await _repository.open(path);
+        if (restored.every((item) => item.sourcePath != document.sourcePath)) {
+          restored.add(document);
+        }
+      } catch (error) {
+        // Keep the remaining library usable if one persisted file was moved or
+        // became unreadable. The path remains on disk so a transient native
+        // renderer failure does not delete the user's import.
+        firstError ??= '无法恢复导入谱面：$error';
+      }
+    }
+
+    if (!mounted) return;
     try {
       final demo = await _repository.openAsset('assets/demo/reader-demo.mscx');
-      if (!mounted) return;
-      setState(() {
-        _documents.add(demo);
-        _loading = false;
-      });
+      if (restored.every((item) => item.sourcePath != demo.sourcePath)) {
+        restored.add(demo);
+      }
     } catch (error) {
-      if (!mounted) return;
-      setState(() {
-        _loading = false;
-        _error = '$error';
-      });
+      firstError ??= '$error';
     }
+
+    if (!mounted) return;
+    setState(() {
+      _documents
+        ..clear()
+        ..addAll(restored);
+      _loading = false;
+      _error = firstError;
+    });
   }
 
   Future<void> _importScore() async {

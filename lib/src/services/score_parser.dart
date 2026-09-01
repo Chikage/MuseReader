@@ -588,6 +588,7 @@ class ScoreParser {
                   _firstInt(container, 'velocity') ??
                   80;
               final tuning = _firstDouble(note, 'tuning');
+              final noteheadFilled = _noteheadFilled(container, note);
 
               // MuseScore stores optional user NoteEvent entries below
               // <Events>.  They are used by microtonal plugins (including
@@ -603,6 +604,7 @@ class ScoreParser {
                     endTick: eventEnd,
                     pitch: pitch,
                     tuning: tuning,
+                    noteheadFilled: noteheadFilled,
                     velocity: velocity.clamp(1, 127),
                     staff: staffIndex,
                     voice: voice,
@@ -627,6 +629,7 @@ class ScoreParser {
                     endTick: endTick,
                     pitch: adjustedPitch,
                     tuning: tuning,
+                    noteheadFilled: noteheadFilled,
                     velocity: velocity.clamp(1, 127),
                     staff: staffIndex,
                     voice: voice,
@@ -792,6 +795,18 @@ class ScoreParser {
         final measureLeft =
             margin + slot * ((pageWidth - margin * 2) / measuresPerSystem);
         final measureWidth = (pageWidth - margin * 2) / measuresPerSystem;
+        if (slot == 0) {
+          // MuseScore's Measure::layoutMeasureNumber() creates one generated
+          // MeasureNumber at the first measure of each system.  Keep the
+          // fallback canvas consistent with that line-oriented placement.
+          glyphs.add(
+            ScoreGlyph(
+              kind: GlyphKind.measureNumber,
+              rect: ScoreRect(measureLeft, systemTop - 25, 48, 18),
+              text: '${measure.number}',
+            ),
+          );
+        }
         final staffSpacing = 78.0;
         for (var staff = 0; staff < staffCount; staff++) {
           final staffTop = systemTop + staff * staffSpacing;
@@ -855,7 +870,7 @@ class ScoreParser {
                 rect: ScoreRect(noteX, noteY, 13, 9),
                 pitch: event.pitch,
                 eventIndex: entry.key,
-                filled: _durationLooksOpen(event, measure),
+                filled: event.noteheadFilled,
               ),
             );
           }
@@ -940,10 +955,37 @@ class ScoreParser {
     return List.unmodifiable(result);
   }
 
-  bool _durationLooksOpen(PlaybackEvent event, ScoreMeasure measure) {
-    final duration = event.endTick - event.startTick;
-    final span = math.max(1, measure.endTick - measure.startTick);
-    return duration >= span / 2;
+  /// Resolve the visual notehead style independently from playback duration.
+  /// MuseScore allows a note to override the chord duration's head type, so
+  /// prefer the note-level value when it is one of the standard head names.
+  /// Unknown/missing values retain the historical filled-quarter fallback.
+  bool _noteheadFilled(XmlElement chord, XmlElement note) {
+    final explicit = _firstText(note, 'headType')?.trim().toLowerCase();
+    final chordType = _firstText(chord, 'durationType')?.trim().toLowerCase();
+    final type = switch (explicit) {
+      // MuseScore 3.x writes an explicit Note::headType as the enum value
+      // (-1=auto, 0=whole, 1=half, 2=quarter, 3=brevis), while
+      // durationType is written as a name.  Normalize both forms before
+      // deciding whether the overlay should use a fill or an outline.
+      '-1' || 'auto' || 'head_auto' => chordType,
+      '0' || 'whole' || 'head_whole' || 'measure' => 'whole',
+      '1' || 'half' || 'head_half' => 'half',
+      '2' || 'quarter' || 'head_quarter' => 'quarter',
+      '3' || 'breve' || 'brevis' || 'head_brevis' => 'breve',
+      'long' || 'longa' => 'long',
+      _ => chordType,
+    };
+    switch (type) {
+      case 'whole':
+      case 'measure':
+      case 'half':
+      case 'breve':
+      case 'long':
+      case 'longa':
+        return false;
+      default:
+        return true;
+    }
   }
 
   static Uint8List _asBytes(dynamic content) {

@@ -64,6 +64,23 @@ class MuseScoreBridge {
     }
   }
 
+  /// Returns the Android audio sink's current presentation position.
+  ///
+  /// Audio output is allowed to have a device/AVD buffer, so a wall-clock
+  /// estimate on the Flutter side can run ahead of what is audible. Platforms
+  /// without this optional method return `null`, preserving the deterministic
+  /// local-clock fallback used by tests and desktop builds.
+  static Future<int?> audioPositionUs() async {
+    try {
+      final raw = await _channel.invokeMethod<Object?>('audioPositionUs');
+      return _asIntOrNull(raw);
+    } on MissingPluginException {
+      return null;
+    } on PlatformException {
+      return null;
+    }
+  }
+
   static ScoreDocument _documentFromMap(
     Map<dynamic, dynamic> map,
     String path,
@@ -122,6 +139,10 @@ class MuseScoreBridge {
               endUs: _asIntOrNull(raw['endUs']),
               pitch: _asInt(raw['pitch'], fallback: 60),
               tuning: _asTuning(raw),
+              noteheadFilled: _asBool(
+                raw['noteheadFilled'] ?? raw['noteHeadFilled'] ?? raw['filled'],
+                fallback: true,
+              ),
               velocity: _asInt(
                 raw['velocity'],
                 fallback: 80,
@@ -136,6 +157,12 @@ class MuseScoreBridge {
               bank: _asInt(raw['bank']).clamp(0, 16383).toInt(),
               pageIndex: _asIntOrNull(raw['page']),
               pageRect: _scoreRectOrNull(raw['rect']),
+              noteheadImageBytes: _bytesOrNull(
+                raw['noteheadImage'] ?? raw['noteHeadImage'],
+              ),
+              noteheadRect: _scoreRectOrNull(
+                raw['noteheadRect'] ?? raw['noteHeadRect'],
+              ),
               cursorRect: _scoreRectOrNull(raw['cursor']),
               cursorEndX: _asDoubleOrNull(raw['cursorEndX']),
             ),
@@ -296,6 +323,26 @@ class MuseScoreBridge {
 
   static int _asInt(dynamic value, {int fallback = 0}) {
     return _asIntOrNull(value) ?? fallback;
+  }
+
+  static bool _asBool(dynamic value, {bool fallback = false}) {
+    if (value == null) return fallback;
+    if (value is bool) return value;
+    if (value is num) return value != 0;
+    switch ('$value'.trim().toLowerCase()) {
+      case 'true':
+      case 'yes':
+      case 'on':
+      case '1':
+        return true;
+      case 'false':
+      case 'no':
+      case 'off':
+      case '0':
+        return false;
+      default:
+        return fallback;
+    }
   }
 
   static int? _asIntOrNull(dynamic value) {

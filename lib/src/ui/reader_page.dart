@@ -109,7 +109,6 @@ class _ReaderPageState extends State<ReaderPage> {
       ),
       body: Column(
         children: [
-          _ScoreInfoBar(document: widget.document, playback: _playback),
           Expanded(
             child: ColoredBox(
               color: theme.colorScheme.surfaceContainerLowest,
@@ -133,65 +132,6 @@ class _ReaderPageState extends State<ReaderPage> {
             onPageChanged: _changePage,
           ),
         ],
-      ),
-    );
-  }
-}
-
-class _ScoreInfoBar extends StatelessWidget {
-  const _ScoreInfoBar({required this.document, required this.playback});
-
-  final ScoreDocument document;
-  final PlaybackController playback;
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.fromLTRB(20, 11, 20, 10),
-      decoration: BoxDecoration(
-        color: theme.colorScheme.surface,
-        border: Border(
-          bottom: BorderSide(color: theme.colorScheme.outlineVariant),
-        ),
-      ),
-      child: LayoutBuilder(
-        builder: (context, constraints) {
-          final measure = playback.currentMeasure;
-          final details = Text(
-            '${playback.speed.toStringAsFixed(1)}×${measure == null ? '' : '  第 $measure 小节'}',
-            style: theme.textTheme.labelSmall?.copyWith(
-              color: theme.colorScheme.onSurfaceVariant,
-              fontFeatures: const [FontFeature.tabularFigures()],
-            ),
-          );
-          final composer = Text(
-            document.composer.isEmpty ? document.fileName : document.composer,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: theme.textTheme.bodySmall?.copyWith(
-              color: theme.colorScheme.onSurfaceVariant,
-            ),
-          );
-          if (constraints.maxWidth < 460) {
-            return Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                composer,
-                const SizedBox(height: 3),
-                Align(alignment: Alignment.centerRight, child: details),
-              ],
-            );
-          }
-          return Row(
-            children: [
-              Expanded(child: composer),
-              const SizedBox(width: 12),
-              details,
-            ],
-          );
-        },
       ),
     );
   }
@@ -608,31 +548,13 @@ class _PageViewport extends StatelessWidget {
     final safePageWidth = page.width <= 0 ? 1.0 : page.width;
     final height = math.max(1.0, width * page.height / safePageWidth);
     final content = page.imageBytes != null
-        ? Stack(
-            children: [
-              Image.memory(
-                page.imageBytes!,
-                width: width,
-                height: height,
-                fit: BoxFit.fill,
-                filterQuality: FilterQuality.high,
-                gaplessPlayback: true,
-              ),
-              Positioned.fill(
-                child: IgnorePointer(
-                  child: CustomPaint(
-                    painter: _PlaybackOverlayPainter(
-                      pageWidth: page.width,
-                      pageHeight: page.height,
-                      rects: activePageRects,
-                      notes: activeNotes,
-                      cursor: playbackCursor,
-                      color: museScorePlaybackColor,
-                    ),
-                  ),
-                ),
-              ),
-            ],
+        ? _NativePageStack(
+            page: page,
+            width: width,
+            height: height,
+            activePageRects: activePageRects,
+            activeNotes: activeNotes,
+            playbackCursor: playbackCursor,
           )
         : CustomPaint(
             size: Size(width, height),
@@ -652,6 +574,97 @@ class _PageViewport extends StatelessWidget {
         color: Colors.white,
         child: SizedBox(width: width, height: height, child: content),
       ),
+    );
+  }
+}
+
+class _NativePageStack extends StatelessWidget {
+  const _NativePageStack({
+    required this.page,
+    required this.width,
+    required this.height,
+    required this.activePageRects,
+    required this.activeNotes,
+    required this.playbackCursor,
+  });
+
+  final ScorePage page;
+  final double width;
+  final double height;
+  final List<ScoreRect> activePageRects;
+  final List<PlaybackEvent> activeNotes;
+  final ScoreRect? playbackCursor;
+
+  @override
+  Widget build(BuildContext context) {
+    final safePageWidth = page.width <= 0 ? 1.0 : page.width;
+    final safePageHeight = page.height <= 0 ? 1.0 : page.height;
+    final scaleX = width / safePageWidth;
+    final scaleY = height / safePageHeight;
+    final noteheadLayers = <Widget>[];
+    for (var index = 0; index < activeNotes.length; index++) {
+      final note = activeNotes[index];
+      final image = note.noteheadImageBytes;
+      final rect = note.noteheadRect;
+      if (image == null || image.isEmpty || rect == null || !rect.isFinite) {
+        continue;
+      }
+      final scaled = Rect.fromLTWH(
+        rect.left * scaleX,
+        rect.top * scaleY,
+        rect.width * scaleX,
+        rect.height * scaleY,
+      );
+      if (!scaled.isFinite || scaled.width <= 0 || scaled.height <= 0) {
+        continue;
+      }
+      noteheadLayers.add(
+        Positioned(
+          key: ValueKey<Object>(note),
+          left: scaled.left,
+          top: scaled.top,
+          width: scaled.width,
+          height: scaled.height,
+          child: IgnorePointer(
+            child: Image.memory(
+              image,
+              fit: BoxFit.fill,
+              filterQuality: FilterQuality.high,
+              gaplessPlayback: true,
+              excludeFromSemantics: true,
+            ),
+          ),
+        ),
+      );
+    }
+
+    return Stack(
+      clipBehavior: Clip.hardEdge,
+      children: [
+        Image.memory(
+          page.imageBytes!,
+          width: width,
+          height: height,
+          fit: BoxFit.fill,
+          filterQuality: FilterQuality.high,
+          gaplessPlayback: true,
+        ),
+        ...noteheadLayers,
+        Positioned.fill(
+          child: IgnorePointer(
+            child: CustomPaint(
+              painter: _PlaybackOverlayPainter(
+                pageWidth: page.width,
+                pageHeight: page.height,
+                rects: activePageRects,
+                notes: activeNotes,
+                cursor: playbackCursor,
+                color: museScorePlaybackColor,
+              ),
+            ),
+          ),
+        ),
+      ],
     );
   }
 }
@@ -685,6 +698,12 @@ class _PlaybackOverlayPainter extends CustomPainter {
     // so reproduce the notehead/stem silhouette in the small note bounding
     // rectangles supplied by the bridge.
     for (final note in notes) {
+      // New native events carry the exact MuseScore glyph as a transparent
+      // image layer.  Leave those pixels to _NativePageStack so we do not
+      // add a second, approximate ellipse underneath them.
+      if (note.noteheadImageBytes != null && note.noteheadRect != null) {
+        continue;
+      }
       final noteRect = note.pageRect;
       if (noteRect == null || !noteRect.isFinite) continue;
       _drawMarkedNote(
@@ -695,6 +714,7 @@ class _PlaybackOverlayPainter extends CustomPainter {
           noteRect.width * scaleX,
           noteRect.height * scaleY,
         ),
+        filled: note.noteheadFilled,
       );
     }
     // Keep compatibility with callers that only have rectangles (documents
@@ -728,11 +748,14 @@ class _PlaybackOverlayPainter extends CustomPainter {
     canvas.drawRect(scaledCursor, cursorPaint);
   }
 
-  void _drawMarkedNote(Canvas canvas, Rect rect) {
+  void _drawMarkedNote(Canvas canvas, Rect rect, {required bool filled}) {
     if (rect.isEmpty) return;
     final headPaint = Paint()
       ..color = color
-      ..style = PaintingStyle.fill;
+      ..style = filled ? PaintingStyle.fill : PaintingStyle.stroke
+      // Keep the outline light enough that the existing white interior of a
+      // hollow head remains visible at normal page scale.
+      ..strokeWidth = math.max(1.0, math.min(rect.width, rect.height) * 0.16);
     canvas.save();
     canvas.translate(rect.center.dx, rect.center.dy);
     canvas.rotate(-0.22);
@@ -786,7 +809,14 @@ class _TransportBar extends StatelessWidget {
               final progress = playback.progress.clamp(0.0, 1.0).toDouble();
               return LayoutBuilder(
                 builder: (context, constraints) {
-                  final compact = constraints.maxWidth < 520;
+                  // The inline timeline needs a little more room than the
+                  // previous two-row transport layout.  Keep the auxiliary
+                  // controls on their own row until the primary controls can
+                  // offer the scrubber a comfortable hit target.
+                  final compact = constraints.maxWidth < 700;
+                  // Padding leaves roughly 32 px less than the device width;
+                  // reserve the stacked variant for genuinely narrow phones.
+                  final ultraCompact = constraints.maxWidth < 320;
                   final timeline = Slider(
                     value: progress,
                     onChanged: playback.durationUs == 0
@@ -795,46 +825,63 @@ class _TransportBar extends StatelessWidget {
                             (value * playback.durationUs).round(),
                           ),
                   );
-                  final primary = Row(
-                    children: [
-                      Text(
-                        formatScoreDuration(playback.positionUs),
-                        style: theme.textTheme.labelMedium?.copyWith(
-                          fontFeatures: const [FontFeature.tabularFigures()],
-                        ),
-                      ),
-                      const SizedBox(width: 6),
-                      IconButton(
-                        onPressed: playback.restart,
-                        icon: const Icon(Icons.restart_alt),
-                        tooltip: '从头开始',
-                      ),
-                      Tooltip(
-                        message: playback.isPlaying ? '暂停' : '播放',
-                        child: FilledButton(
-                          onPressed: playback.toggle,
-                          style: FilledButton.styleFrom(
-                            shape: const CircleBorder(),
-                            padding: const EdgeInsets.all(14),
-                            minimumSize: const Size(52, 52),
-                          ),
-                          child: Icon(
-                            playback.isPlaying ? Icons.pause : Icons.play_arrow,
-                            size: 25,
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 6),
-                      Text(
-                        formatScoreDuration(playback.durationUs),
-                        style: theme.textTheme.labelMedium?.copyWith(
-                          color: theme.colorScheme.onSurfaceVariant,
-                          fontFeatures: const [FontFeature.tabularFigures()],
-                        ),
-                      ),
-                    ],
+                  final playbackTime = Text(
+                    '${formatScoreDuration(playback.positionUs)}/${formatScoreDuration(playback.durationUs)}',
+                    style: theme.textTheme.labelMedium?.copyWith(
+                      fontFeatures: const [FontFeature.tabularFigures()],
+                    ),
                   );
-                  final pageControls = Row(
+                  final restartButton = IconButton(
+                    onPressed: playback.restart,
+                    icon: const Icon(Icons.restart_alt),
+                    tooltip: '从头开始',
+                  );
+                  final playButton = Tooltip(
+                    message: playback.isPlaying ? '暂停' : '播放',
+                    child: FilledButton(
+                      onPressed: playback.toggle,
+                      style: FilledButton.styleFrom(
+                        shape: const CircleBorder(),
+                        padding: const EdgeInsets.all(14),
+                        minimumSize: const Size(52, 52),
+                      ),
+                      child: Icon(
+                        playback.isPlaying ? Icons.pause : Icons.play_arrow,
+                        size: 25,
+                      ),
+                    ),
+                  );
+                  final primary = ultraCompact
+                      ? Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Row(
+                              children: [
+                                restartButton,
+                                playButton,
+                                const SizedBox(width: 8),
+                                // Keep the scrubber immediately after the
+                                // play button even at the narrowest width.
+                                Expanded(child: timeline),
+                              ],
+                            ),
+                            playbackTime,
+                          ],
+                        )
+                      : Row(
+                          children: [
+                            playbackTime,
+                            const SizedBox(width: 8),
+                            restartButton,
+                            playButton,
+                            const SizedBox(width: 8),
+                            // Keep the scrubber immediately after the play
+                            // button so it remains the primary playback
+                            // control on all sizes.
+                            Expanded(child: timeline),
+                          ],
+                        );
+                  final pageControlsContent = Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       IconButton(
@@ -844,7 +891,7 @@ class _TransportBar extends StatelessWidget {
                         icon: const Icon(Icons.chevron_left),
                         tooltip: '上一页',
                       ),
-                      Text('$pageCount 页中第 ${page + 1} 页'),
+                      Text('${page + 1}/$pageCount'),
                       IconButton(
                         onPressed: page + 1 < pageCount
                             ? () => onPageChanged(page + 1)
@@ -854,50 +901,31 @@ class _TransportBar extends StatelessWidget {
                       ),
                     ],
                   );
-                  final speedMenu = PopupMenuButton<double>(
-                    tooltip: '播放速度',
-                    initialValue: playback.speed,
-                    onSelected: playback.setSpeed,
-                    itemBuilder: (context) => [
-                      for (final speed in const [
-                        0.5,
-                        0.75,
-                        1.0,
-                        1.25,
-                        1.5,
-                        2.0,
-                      ])
-                        PopupMenuItem<double>(
-                          value: speed,
-                          child: Text('${speed.toStringAsFixed(2)}×'),
-                        ),
-                    ],
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        const Icon(Icons.speed_outlined, size: 20),
-                        const SizedBox(width: 5),
-                        Text('${playback.speed.toStringAsFixed(1)}×'),
-                      ],
-                    ),
-                  );
+                  final pageControls = ultraCompact
+                      ? SizedBox(
+                          width: constraints.maxWidth,
+                          child: FittedBox(
+                            fit: BoxFit.scaleDown,
+                            child: pageControlsContent,
+                          ),
+                        )
+                      : pageControlsContent;
                   return Column(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      timeline,
                       if (compact) ...[
                         primary,
-                        Row(
-                          mainAxisAlignment: MainAxisAlignment.end,
-                          children: [speedMenu, pageControls],
-                        ),
+                        if (ultraCompact) ...[
+                          pageControls,
+                        ] else
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.end,
+                            children: [pageControls],
+                          ),
                       ] else
                         Row(
                           children: [
-                            primary,
-                            const Spacer(),
-                            speedMenu,
-                            const SizedBox(width: 4),
+                            Expanded(child: primary),
                             pageControls,
                           ],
                         ),

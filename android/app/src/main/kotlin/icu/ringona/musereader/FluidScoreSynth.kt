@@ -4,6 +4,7 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
+import android.os.Process
 import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
@@ -14,12 +15,20 @@ class FluidScoreSynth {
     companion object {
         private const val TAG = "MuseReaderFluid"
         private const val FRAMES_PER_BLOCK = 1024
+        // FluidSynth can take longer than one mixer period on an emulator.
+        // Queue a few blocks before starting AudioTrack so the first render
+        // does not immediately underrun and get disabled by AudioFlinger.
+        private const val PREBUFFER_BLOCKS = 3
     }
 
     private val lock = Any()
     private var track: AudioTrack? = null
     private var worker: Thread? = null
     private var generation = 0
+    private var basePositionUs = 0L
+    private var playbackSpeed = 1.0
+    private var playbackSampleRate = 44_100
+    private var lastPositionUs = 0L
 
     /** Starts native playback, returning false when the embedded renderer is unavailable. */
     fun start(rawEvents: List<Any?>, positionUs: Long, speed: Double): Boolean {
@@ -70,6 +79,10 @@ class FluidScoreSynth {
             generation += 1
             localGeneration = generation
             track = audio
+            basePositionUs = positionUs.coerceAtLeast(0L)
+            playbackSpeed = if (speed.isFinite()) speed.coerceAtLeast(0.0) else 1.0
+            playbackSampleRate = sampleRate.coerceAtLeast(1)
+            lastPositionUs = basePositionUs
         }
         val thread = Thread {
             runAudio(audio, localGeneration)
@@ -83,6 +96,33 @@ class FluidScoreSynth {
         return true
     }
 
+    /** Returns the position currently presented by AudioTrack, if running. */
+    fun positionUs(): Long? {
+        val snapshot = synchronized(lock) {
+            val current = track ?: return@synchronized null
+            TrackSnapshot(
+                audio = current,
+                basePositionUs = basePositionUs,
+                speed = playbackSpeed,
+                sampleRate = playbackSampleRate,
+                lastPositionUs = lastPositionUs,
+            )
+        } ?: return null
+
+        val position = AudioTrackClock.positionUs(
+            audio = snapshot.audio,
+            basePositionUs = snapshot.basePositionUs,
+            speed = snapshot.speed,
+            sampleRate = snapshot.sampleRate,
+            lastPositionUs = snapshot.lastPositionUs,
+        )
+        return synchronized(lock) {
+            if (track !== snapshot.audio) return@synchronized null
+            lastPositionUs = max(lastPositionUs, position)
+            lastPositionUs
+        }
+    }
+
     fun stop() {
         val oldTrack: AudioTrack?
         val oldWorker: Thread?
@@ -92,6 +132,10 @@ class FluidScoreSynth {
             oldWorker = worker
             track = null
             worker = null
+            basePositionUs = 0L
+            playbackSpeed = 1.0
+            playbackSampleRate = 44_100
+            lastPositionUs = 0L
         }
         NativeMuseScoreEngine.audioStop()
         try {
@@ -114,6 +158,51 @@ class FluidScoreSynth {
         val floatBuffer = FloatArray(FRAMES_PER_BLOCK * 2)
         val shortBuffer = ShortArray(FRAMES_PER_BLOCK * 2)
         try {
+            try {
+                Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
+            } catch (_: SecurityException) {
+                // Some vendor builds do not allow changing the worker
+                // priority. Playback remains functional without the hint.
+            }
+
+            // AudioTrack starts consuming as soon as play() is called. Fill a
+            // bounded amount while it is still paused so a slow first native
+            // render (especially on an AVD) cannot cause an initial underrun.
+            val capacityFrames = try {
+                audio.bufferSizeInFrames
+            } catch (_: IllegalStateException) {
+                FRAMES_PER_BLOCK * PREBUFFER_BLOCKS
+            }
+            val prebufferFrames = capacityFrames.coerceIn(
+                FRAMES_PER_BLOCK,
+                FRAMES_PER_BLOCK * PREBUFFER_BLOCKS,
+            )
+            var bufferedFrames = 0
+            while (bufferedFrames < prebufferFrames && isCurrent(localGeneration)) {
+                val frames = NativeMuseScoreEngine.audioRender(floatBuffer)
+                if (frames <= 0) {
+                    if (!NativeMuseScoreEngine.audioIsActive()) break
+                    Thread.yield()
+                    continue
+                }
+                val sampleCount = (frames * 2).coerceAtMost(floatBuffer.size)
+                for (index in 0 until sampleCount) {
+                    shortBuffer[index] = (floatBuffer[index] * Short.MAX_VALUE)
+                        .toInt()
+                        .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
+                        .toShort()
+                }
+                var offset = 0
+                while (offset < sampleCount && isCurrent(localGeneration)) {
+                    val written = audio.write(shortBuffer, offset, sampleCount - offset)
+                    if (written <= 0) break
+                    offset += written
+                }
+                if (offset <= 0) break
+                bufferedFrames += offset / 2
+                if (offset < sampleCount) break
+            }
+            if (!isCurrent(localGeneration) || bufferedFrames <= 0) return
             audio.play()
             while (isCurrent(localGeneration)) {
                 val frames = NativeMuseScoreEngine.audioRender(floatBuffer)
@@ -160,6 +249,14 @@ class FluidScoreSynth {
     private fun isCurrent(localGeneration: Int): Boolean = synchronized(lock) {
         generation == localGeneration && !Thread.currentThread().isInterrupted
     }
+
+    private data class TrackSnapshot(
+        val audio: AudioTrack,
+        val basePositionUs: Long,
+        val speed: Double,
+        val sampleRate: Int,
+        val lastPositionUs: Long,
+    )
 
     private fun encodeEvents(rawEvents: List<Any?>): String {
         val array = JSONArray()

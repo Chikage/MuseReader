@@ -1,15 +1,23 @@
 package icu.ringona.musereader
 
+import org.qtproject.qt5.android.QtNative
+
 /** JNI boundary for the packaged MuseScore 3.6.2 reader core. */
 object NativeMuseScoreEngine {
     private var loaded = false
 
     init {
         try {
+            // Qt's JNI bootstrap uses this class loader for lookups made from
+            // native worker threads. Normally QtActivityDelegate sets it
+            // before loading Qt; MuseReader loads the engine directly, so set
+            // the same value first.
+            QtNative.setClassLoader(NativeMuseScoreEngine::class.java.classLoader)
             System.loadLibrary("muse_reader_engine")
             loaded = true
-        } catch (_: UnsatisfiedLinkError) {
-            // Dart strict mode turns this into a visible load failure.
+        } catch (_: LinkageError) {
+            // A missing Qt jar or native dependency should remain a visible
+            // fail-closed load failure instead of crashing Activity startup.
         }
     }
 

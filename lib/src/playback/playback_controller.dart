@@ -16,6 +16,9 @@ class PlaybackController extends ChangeNotifier {
   double _speed = 1.0;
   bool _isPlaying = false;
   bool _cursorVisible = false;
+  int? _audioPositionUs;
+  bool _audioPositionQueryInFlight = false;
+  int _playbackGeneration = 0;
 
   bool get isPlaying => _isPlaying;
   double get speed => _speed;
@@ -23,6 +26,10 @@ class PlaybackController extends ChangeNotifier {
 
   int get positionUs {
     if (!_isPlaying || _clock == null) return _positionUs;
+    final audioPosition = _audioPositionUs;
+    if (audioPosition != null) {
+      return audioPosition.clamp(0, durationUs).toInt();
+    }
     final elapsed = _clock!.elapsedMicroseconds;
     return (_basePositionUs + elapsed * _speed)
         .round()
@@ -74,27 +81,38 @@ class PlaybackController extends ChangeNotifier {
     if (positionUs >= durationUs) {
       _positionUs = 0;
     }
+    final generation = ++_playbackGeneration;
     _basePositionUs = _positionUs;
-    _clock = Stopwatch()..start();
+    // Keep the clock stopped until Android has created and primed its
+    // AudioTrack.  Starting it before the first PCM block is presented makes
+    // the blue cursor run ahead by the AVD/device output latency.
+    _clock = null;
+    _audioPositionUs = null;
     _isPlaying = true;
     _cursorVisible = true;
     _timer?.cancel();
-    _timer = Timer.periodic(const Duration(milliseconds: 16), (_) {
-      _syncPosition();
-    });
     notifyListeners();
     await MuseScoreBridge.startAudio(
       document,
       positionUs: _basePositionUs,
       speed: _speed,
     );
+    if (!_isPlaying || generation != _playbackGeneration) return;
+    _clock = Stopwatch()..start();
+    _startPositionTimer(generation);
+    await _syncPosition(generation);
   }
 
   Future<void> pause() async {
     if (!_isPlaying) return;
-    _syncPosition();
+    await _syncPosition();
+    if (!_isPlaying) return;
+    final current = positionUs;
+    _playbackGeneration += 1;
+    _positionUs = current;
     _isPlaying = false;
     _cursorVisible = false;
+    _audioPositionUs = null;
     _clock?.stop();
     _timer?.cancel();
     _timer = null;
@@ -114,15 +132,25 @@ class PlaybackController extends ChangeNotifier {
   Future<void> seekToUs(int microseconds) async {
     final next = microseconds.clamp(0, durationUs).toInt();
     _positionUs = next;
+    _audioPositionUs = null;
     _cursorVisible = true;
     if (_isPlaying) {
+      final generation = ++_playbackGeneration;
       _basePositionUs = next;
-      _clock = Stopwatch()..start();
+      _clock?.stop();
+      _clock = null;
+      _timer?.cancel();
+      _timer = null;
       await MuseScoreBridge.startAudio(
         document,
         positionUs: next,
         speed: _speed,
       );
+      if (_isPlaying && generation == _playbackGeneration) {
+        _clock = Stopwatch()..start();
+        _startPositionTimer(generation);
+        await _syncPosition(generation);
+      }
     }
     notifyListeners();
   }
@@ -130,39 +158,81 @@ class PlaybackController extends ChangeNotifier {
   Future<void> setSpeed(double value) async {
     final next = value.clamp(0.5, 2.0).toDouble();
     if ((next - _speed).abs() < 0.001) return;
-    if (_isPlaying) _syncPosition();
+    if (_isPlaying) await _syncPosition();
     _speed = next;
     if (_isPlaying) {
+      final generation = ++_playbackGeneration;
       _basePositionUs = _positionUs;
-      _clock = Stopwatch()..start();
+      _audioPositionUs = null;
+      _clock?.stop();
+      _clock = null;
+      _timer?.cancel();
+      _timer = null;
       await MuseScoreBridge.startAudio(
         document,
         positionUs: _positionUs,
         speed: _speed,
       );
+      if (_isPlaying && generation == _playbackGeneration) {
+        _clock = Stopwatch()..start();
+        _startPositionTimer(generation);
+        await _syncPosition(generation);
+      }
     }
     notifyListeners();
   }
 
-  void _syncPosition() {
+  void _startPositionTimer(int generation) {
+    _timer?.cancel();
+    _timer = Timer.periodic(const Duration(milliseconds: 16), (_) {
+      unawaited(_syncPosition(generation));
+    });
+  }
+
+  Future<void> _syncPosition([int? expectedGeneration]) async {
     if (!_isPlaying) return;
-    final next = positionUs;
-    if (next >= durationUs) {
-      _positionUs = durationUs;
-      _isPlaying = false;
-      _cursorVisible = false;
-      _clock?.stop();
-      _timer?.cancel();
-      _timer = null;
-      unawaited(MuseScoreBridge.stopAudio());
-    } else {
-      _positionUs = next;
+    final generation = expectedGeneration ?? _playbackGeneration;
+    if (generation != _playbackGeneration || _audioPositionQueryInFlight) {
+      return;
     }
-    notifyListeners();
+    _audioPositionQueryInFlight = true;
+    try {
+      final reported = await MuseScoreBridge.audioPositionUs();
+      if (!_isPlaying || generation != _playbackGeneration) return;
+
+      // A missing track means the optional Android clock is unavailable (or
+      // has just finished). Rebase the local fallback at the last reported
+      // audio position so a temporary query gap cannot introduce a jump.
+      if (reported == null && _audioPositionUs != null) {
+        _positionUs = _audioPositionUs!.clamp(0, durationUs).toInt();
+        _basePositionUs = _positionUs;
+        _clock = Stopwatch()..start();
+      }
+      _audioPositionUs = reported?.clamp(0, durationUs).toInt();
+
+      final next = positionUs;
+      if (next >= durationUs) {
+        _positionUs = durationUs;
+        _isPlaying = false;
+        _cursorVisible = false;
+        _audioPositionUs = null;
+        _clock?.stop();
+        _timer?.cancel();
+        _timer = null;
+        _playbackGeneration += 1;
+        unawaited(MuseScoreBridge.stopAudio());
+      } else {
+        _positionUs = next;
+      }
+      notifyListeners();
+    } finally {
+      _audioPositionQueryInFlight = false;
+    }
   }
 
   @override
   void dispose() {
+    _playbackGeneration += 1;
     _timer?.cancel();
     _clock?.stop();
     unawaited(MuseScoreBridge.stopAudio());
@@ -171,8 +241,17 @@ class PlaybackController extends ChangeNotifier {
 }
 
 String formatScoreDuration(int microseconds) {
-  final totalSeconds = (microseconds / Duration.microsecondsPerSecond).floor();
-  final minutes = totalSeconds ~/ 60;
+  // Truncate sub-second values: the transport clock advances continuously,
+  // while the reader intentionally presents a stable, whole-second label.
+  final totalSeconds =
+      (microseconds < 0 ? 0 : microseconds) ~/ Duration.microsecondsPerSecond;
   final seconds = totalSeconds % 60;
-  return '$minutes:${seconds.toString().padLeft(2, '0')}';
+  final secondLabel = seconds.toString().padLeft(2, '0');
+  if (totalSeconds >= Duration.secondsPerHour) {
+    final hours = totalSeconds ~/ Duration.secondsPerHour;
+    final minutes = (totalSeconds ~/ Duration.secondsPerMinute) % 60;
+    return '$hours:${minutes.toString().padLeft(2, '0')}:$secondLabel';
+  }
+  final minutes = totalSeconds ~/ Duration.secondsPerMinute;
+  return '$minutes:$secondLabel';
 }

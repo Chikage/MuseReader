@@ -19,6 +19,7 @@ class MainActivity : FlutterActivity() {
         private const val FILE_CHANNEL = "com.musereader/files"
         private const val ENGINE_CHANNEL = "com.musereader/musescore_engine"
         private const val PICK_SCORE_REQUEST = 4101
+        private const val IMPORT_DIRECTORY = "muse_reader/imports"
     }
 
     private var pendingFileResult: MethodChannel.Result? = null
@@ -37,6 +38,9 @@ class MainActivity : FlutterActivity() {
             .setMethodCallHandler { call, result ->
                 when (call.method) {
                     "pickScoreFile" -> pickScoreFile(result)
+                    "listImportedScoreFiles" -> result.success(
+                        runCatching { listImportedScoreFiles() }.getOrDefault(emptyList()),
+                    )
                     else -> result.notImplemented()
                 }
             }
@@ -106,6 +110,15 @@ class MainActivity : FlutterActivity() {
                         fallbackSynth.stop()
                         result.success(null)
                     }
+                    "audioPositionUs" -> {
+                        // Prefer the native track when available, but expose
+                        // the same clock for the oscillator fallback.  A
+                        // nullable result tells Flutter to use its local
+                        // clock only while no Android audio track exists.
+                        result.success(
+                            fluidSynth.positionUs() ?: fallbackSynth.positionUs(),
+                        )
+                    }
                     else -> result.notImplemented()
                 }
             }
@@ -139,22 +152,86 @@ class MainActivity : FlutterActivity() {
             return
         }
         try {
-            result.success(copyToCache(data.data!!))
+            result.success(copyToPersistentStorage(data.data!!))
         } catch (error: Exception) {
             result.error("copy_failed", error.message, null)
         }
     }
 
-    private fun copyToCache(uri: Uri): String {
+    /**
+     * Keep imported scores in the app's files directory instead of cacheDir.
+     * Android is allowed to clear cacheDir while the app is not running, which
+     * made an imported score disappear even though it was still listed in the
+     * in-memory Flutter library.
+     */
+    private fun copyToPersistentStorage(uri: Uri): String {
         val name = displayName(uri)
         val safeName = name.replace(Regex("[^A-Za-z0-9._-]"), "_")
-        val directory = File(cacheDir, "muse_reader/imports").apply { mkdirs() }
-        val target = File(directory, "${System.currentTimeMillis()}_$safeName")
+        val directory = importedScoresDirectory()
+        val target = uniqueImportTarget(directory, safeName)
         contentResolver.openInputStream(uri).use { input ->
             requireNotNull(input) { "Cannot open the selected file." }
             target.outputStream().use { output -> input.copyTo(output) }
         }
         return target.absolutePath
+    }
+
+    private fun uniqueImportTarget(directory: File, safeName: String): File {
+        val timestamp = System.currentTimeMillis()
+        var target = File(directory, "${timestamp}_$safeName")
+        var suffix = 1
+        while (target.exists()) {
+            target = File(directory, "${timestamp}_${suffix}_$safeName")
+            suffix += 1
+        }
+        return target
+    }
+
+    /**
+     * Return persisted imports in newest-first order so the Flutter library
+     * keeps the same ordering after a process restart.
+     *
+     * Versions before persistent storage wrote files below cacheDir. Migrate
+     * those files on first read where they are still available.
+     */
+    private fun listImportedScoreFiles(): List<String> {
+        migrateLegacyImports()
+        return importedScoresDirectory()
+            .listFiles()
+            ?.filter { it.isFile && isSupportedScoreFile(it.name) }
+            ?.sortedWith(
+                compareByDescending<File> { it.lastModified() }
+                    .thenByDescending { it.name },
+            )
+            ?.map { it.absolutePath }
+            ?: emptyList()
+    }
+
+    private fun importedScoresDirectory(): File =
+        File(filesDir, IMPORT_DIRECTORY).apply { mkdirs() }
+
+    private fun migrateLegacyImports() {
+        val legacyDirectory = File(cacheDir, IMPORT_DIRECTORY)
+        if (!legacyDirectory.isDirectory) return
+        val destination = importedScoresDirectory()
+        legacyDirectory.listFiles()
+            ?.filter { it.isFile && isSupportedScoreFile(it.name) }
+            ?.forEach { source ->
+                val target = File(destination, source.name)
+                if (target.exists()) return@forEach
+                // renameTo avoids a second copy when both directories are on
+                // the same filesystem. Some devices/filesystems reject the
+                // rename, so retain a copy fallback for those cases.
+                if (!source.renameTo(target)) {
+                    runCatching { source.copyTo(target, overwrite = false) }
+                        .onFailure { target.delete() }
+                }
+            }
+    }
+
+    private fun isSupportedScoreFile(name: String): Boolean {
+        val extension = name.substringAfterLast('.', "").lowercase()
+        return extension == "mscx" || extension == "mscz"
     }
 
     private fun displayName(uri: Uri): String {

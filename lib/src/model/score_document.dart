@@ -3,7 +3,16 @@ import 'dart:typed_data';
 
 enum ScoreFormat { mscx, mscz }
 
-enum GlyphKind { title, composer, staffLine, barline, clef, note, rest }
+enum GlyphKind {
+  title,
+  composer,
+  measureNumber,
+  staffLine,
+  barline,
+  clef,
+  note,
+  rest,
+}
 
 class ScoreRect {
   const ScoreRect(this.left, this.top, this.width, this.height);
@@ -256,6 +265,7 @@ class PlaybackEvent {
     required this.endTick,
     required this.pitch,
     this.tuning = 0.0,
+    this.noteheadFilled = true,
     required this.velocity,
     required this.staff,
     required this.voice,
@@ -268,6 +278,8 @@ class PlaybackEvent {
     this.pageIndex,
     this.glyphIndex,
     this.pageRect,
+    this.noteheadImageBytes,
+    this.noteheadRect,
     this.cursorRect,
     this.cursorEndX,
   });
@@ -285,6 +297,11 @@ class PlaybackEvent {
   /// different microtonal tunings at the same time.
   final double tuning;
 
+  /// Whether MuseScore engraved this notehead as a filled shape. Playback
+  /// marking changes the note colour only; hollow heads (whole, half, and
+  /// breve notes) must remain hollow while they are sounding.
+  final bool noteheadFilled;
+
   final int velocity;
   final int staff;
   final int voice;
@@ -297,6 +314,16 @@ class PlaybackEvent {
   final int? pageIndex;
   final int? glyphIndex;
   final ScoreRect? pageRect;
+
+  /// Exact MuseScore-rendered notehead pixels for playback highlighting.
+  ///
+  /// Native pages are rasterized by MuseScore, so drawing a generic ellipse
+  /// in Flutter cannot reproduce custom notehead shapes or their fractional
+  /// glyph metrics.  When present, this transparent image is placed at
+  /// [noteheadRect] on top of the page image.  Older documents may omit it
+  /// and use the geometric overlay fallback.
+  final Uint8List? noteheadImageBytes;
+  final ScoreRect? noteheadRect;
 
   /// Optional native cursor geometry for scores with repeats.  The event
   /// stream is unrolled by MuseScore, while its note still points at the
@@ -314,14 +341,18 @@ class PlaybackEvent {
     int? pageIndex,
     int? glyphIndex,
     ScoreRect? pageRect,
+    Uint8List? noteheadImageBytes,
+    ScoreRect? noteheadRect,
     ScoreRect? cursorRect,
     double? cursorEndX,
     double? tuning,
+    bool? noteheadFilled,
   }) => PlaybackEvent(
     startTick: startTick,
     endTick: endTick,
     pitch: pitch,
     tuning: tuning ?? this.tuning,
+    noteheadFilled: noteheadFilled ?? this.noteheadFilled,
     velocity: velocity,
     staff: staff,
     voice: voice,
@@ -334,6 +365,8 @@ class PlaybackEvent {
     pageIndex: pageIndex ?? this.pageIndex,
     glyphIndex: glyphIndex ?? this.glyphIndex,
     pageRect: pageRect ?? this.pageRect,
+    noteheadImageBytes: noteheadImageBytes ?? this.noteheadImageBytes,
+    noteheadRect: noteheadRect ?? this.noteheadRect,
     cursorRect: cursorRect ?? this.cursorRect,
     cursorEndX: cursorEndX ?? this.cursorEndX,
   );
@@ -348,6 +381,7 @@ class PlaybackEvent {
     // explicit zero lets the native renderer distinguish a tuned voice from
     // a legacy event when matching note-offs.
     'tuning': tuning.isFinite ? tuning : 0.0,
+    'noteheadFilled': noteheadFilled,
     'velocity': velocity,
     'staff': staff,
     'voice': voice,
