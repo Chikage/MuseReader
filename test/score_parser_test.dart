@@ -350,5 +350,7 @@ void main() {
     expect(document.events.single.tuning, 25);
     expect(document.events.single.startTick, 120);
     expect(document.events.single.endTick, 360);
+    expect(document.events.single.sourceTick, 0);
+    expect(document.events.single.resolvedClickStartUs(document.tempoMap), 0);
   });
 }

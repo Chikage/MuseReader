@@ -137,6 +137,8 @@ class MuseScoreBridge {
               endTick: _asInt(raw['endTick']),
               startUs: _asIntOrNull(raw['startUs']),
               endUs: _asIntOrNull(raw['endUs']),
+              sourceTick: _asIntOrNull(raw['sourceTick']),
+              clickStartUs: _asIntOrNull(raw['clickStartUs']),
               pitch: _asInt(raw['pitch'], fallback: 60),
               tuning: _asTuning(raw),
               noteheadFilled: _asBool(
@@ -195,6 +197,16 @@ class MuseScoreBridge {
         if (imageBytes == null || imageBytes.isEmpty) {
           throw MuseScoreBridgeException('MuseScore 第 ${index + 1} 页缺少完整渲染图像。');
         }
+        final noteTargets = <ScoreNoteTarget>[];
+        final rawNoteTargets = raw['noteTargets'] ?? raw['notes'];
+        if (rawNoteTargets is Iterable) {
+          for (final rawTarget in rawNoteTargets) {
+            if (rawTarget is Map) {
+              final target = _scoreNoteTargetFromMap(rawTarget);
+              if (target != null) noteTargets.add(target);
+            }
+          }
+        }
         pages.add(
           ScorePage(
             index: _asInt(raw['index'], fallback: index),
@@ -204,6 +216,7 @@ class MuseScoreBridge {
             imageBytes: imageBytes,
             pixelWidth: _asPositiveIntOrNull(raw['pixelWidth']),
             pixelHeight: _asPositiveIntOrNull(raw['pixelHeight']),
+            noteTargets: List.unmodifiable(noteTargets),
           ),
         );
       }
@@ -295,6 +308,17 @@ class MuseScoreBridge {
       return null;
     }
     return ScoreRect(left, top, width, height);
+  }
+
+  static ScoreNoteTarget? _scoreNoteTargetFromMap(Map<dynamic, dynamic> raw) {
+    final rect = _scoreRectOrNull(raw['rect'] ?? raw['noteRect']);
+    final sourceTick = _asIntOrNull(raw['sourceTick'] ?? raw['tick']);
+    if (rect == null || sourceTick == null || sourceTick < 0) return null;
+    return ScoreNoteTarget(
+      rect: rect,
+      sourceTick: sourceTick,
+      clickStartUs: _asIntOrNull(raw['clickStartUs']),
+    );
   }
 
   static ScoreCursorSegment? _cursorSegmentFromMap(Map<dynamic, dynamic> raw) {

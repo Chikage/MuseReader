@@ -303,7 +303,10 @@ RenderedNotehead render_notehead(Ms::MasterScore* score,
 
   // Use the same magnification and painter setup as render_page().  The
   // extra score-space margin keeps glyph antialiasing from being clipped at
-  // the bitmap edge while preserving the exact note bbox in page space.
+  // the bitmap edge while preserving the exact note bbox in page space.  The
+  // bitmap is retained for clients of older bridge payloads; the current
+  // Flutter reader uses the accompanying rectangle to recolour the original
+  // page pixels in place instead of compositing this bitmap over the page.
   constexpr double render_dpi = MUSE_READER_RENDER_DPI;
   const double magnification = render_dpi / Ms::DPI;
   constexpr qreal padding = 1.0;
@@ -331,7 +334,7 @@ RenderedNotehead render_notehead(Ms::MasterScore* score,
   // Note::draw uses MuseScore's cached SMuFL symbol and its own fractional
   // bbox, so custom, diamond, percussion and hollow heads all share the
   // exact geometry used by the page rasterization.  Stems are separate
-  // elements and are intentionally not included in this overlay.
+  // elements and are intentionally not included in this legacy payload.
   note->draw(&painter);
   painter.restore();
   painter.end();
@@ -344,6 +347,40 @@ RenderedNotehead render_notehead(Ms::MasterScore* score,
     return {};
   }
   return {QString::fromLatin1(png.toBase64()), crop};
+}
+
+QJsonObject note_target_json(Ms::MasterScore* score,
+                             const Ms::Note* note,
+                             const QRectF& page_box) {
+  QJsonObject result;
+  if (!score || !note || !note->visible() || note->hidden() ||
+      !note->selectable() ||
+      !note->chord() || !note->chord()->measure()) {
+    return result;
+  }
+  const QRectF rect = note->pageBoundingRect()
+                          .translated(-page_box.topLeft())
+                          .normalized();
+  if (rect.isEmpty() || !qIsFinite(rect.left()) ||
+      !qIsFinite(rect.top()) || !qIsFinite(rect.width()) ||
+      !qIsFinite(rect.height()) || !qIsFinite(rect.right()) ||
+      !qIsFinite(rect.bottom())) {
+    return result;
+  }
+  const int source_tick = note->chord()->tick().ticks();
+  const int click_utick = score->repeatList().tick2utick(source_tick);
+  const qreal click_time = score->utick2utime(click_utick);
+  if (!qIsFinite(click_time) || click_time < 0.0) return result;
+
+  QJsonObject target_rect;
+  target_rect.insert("x", rect.x());
+  target_rect.insert("y", rect.y());
+  target_rect.insert("width", rect.width());
+  target_rect.insert("height", rect.height());
+  result.insert("rect", target_rect);
+  result.insert("sourceTick", source_tick);
+  result.insert("clickStartUs", qRound64(click_time * 1000000.0));
+  return result;
 }
 
 struct PendingNote {
@@ -371,6 +408,11 @@ struct PendingNote {
   QRectF cursor_rect;
   qreal cursor_end_x = 0.0;
   bool has_cursor = false;
+  // The visual note belongs to this original-score chord tick.  Its MIDI
+  // event may start later (grace notes/user NoteEvents), while PLAY-mode
+  // clicks seek the parent ChordRest tick.
+  int source_tick = -1;
+  qint64 click_start_us = -1;
 };
 
 bool notehead_is_filled(const Ms::Note* note) {
@@ -588,6 +630,9 @@ QJsonObject note_json(
   result.insert("endTick", end_tick);
   result.insert("startUs", qRound64(start_time * 1000000.0));
   result.insert("endUs", qRound64(end_time * 1000000.0));
+  if (note.source_tick >= 0) result.insert("sourceTick", note.source_tick);
+  if (note.click_start_us >= 0)
+    result.insert("clickStartUs", note.click_start_us);
   result.insert("pitch", note.pitch);
   result.insert("tuning", Ms::normalizedPlayEventTuning(note.tuning));
   result.insert("noteheadFilled", note.notehead_filled);
@@ -706,6 +751,15 @@ QJsonObject open_with_musescore(const char* utf8_path) {
     page_json.insert("pixelWidth", rendered.pixel_width);
     page_json.insert("pixelHeight", rendered.pixel_height);
     page_json.insert("image", rendered.base64_png);
+    QJsonArray note_targets;
+    const QList<Ms::Element*> page_elements = page->elements();
+    for (const Ms::Element* element : page_elements) {
+      if (!element->isNote()) continue;
+      const auto* note = static_cast<const Ms::Note*>(element);
+      const QJsonObject target = note_target_json(&score, note, box);
+      if (!target.isEmpty()) note_targets.append(target);
+    }
+    page_json.insert("noteTargets", note_targets);
     pages.append(page_json);
   }
   document.insert("pages", pages);
@@ -805,8 +859,15 @@ QJsonObject open_with_musescore(const char* utf8_path) {
       qreal cursor_end_x = 0.0;
       bool has_cursor = false;
       bool notehead_filled = true;
+      int source_tick = -1;
+      qint64 click_start_us = -1;
       if (event.note() && event.note()->chord() && event.note()->chord()->measure()) {
         Ms::Measure* measure = event.note()->chord()->measure();
+        source_tick = event.note()->chord()->tick().ticks();
+        const int click_utick = score.repeatList().tick2utick(source_tick);
+        const qreal click_time = score.utick2utime(click_utick);
+        if (qIsFinite(click_time) && click_time >= 0.0)
+          click_start_us = qRound64(click_time * 1000000.0);
         staff = qMax(0, event.note()->staffIdx());
         voice = event.note()->voice();
         measure_number = measure->no() + 1;
@@ -864,7 +925,9 @@ QJsonObject open_with_musescore(const char* utf8_path) {
            notehead_rect,
            cursor_rect,
            cursor_end_x,
-           has_cursor});
+           has_cursor,
+           source_tick,
+           click_start_us});
     } else if (event.type() == Ms::ME_NOTEOFF ||
                (event.type() == Ms::ME_NOTEON && event.velo() == 0)) {
       auto open = active.find(key);

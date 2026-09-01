@@ -612,6 +612,7 @@ class ScoreParser {
                     channel: playback.channel,
                     program: playback.program,
                     bank: playback.bank,
+                    sourceTick: eventStart,
                   ),
                 );
                 continue;
@@ -637,6 +638,7 @@ class ScoreParser {
                     channel: playback.channel,
                     program: playback.program,
                     bank: playback.bank,
+                    sourceTick: eventStart,
                   ),
                 );
               }

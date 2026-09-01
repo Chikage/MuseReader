@@ -20,10 +20,20 @@ The adapter uses the same source of truth for engraving and playback:
 
 The JSON response contains rendered pages, integer-microsecond event times,
 per-note `Note::tuning` cent offsets, and `Note::pageBoundingRect()` coordinates
-from the same laid-out `MasterScore`. Each playable event also carries a tiny
-transparent PNG rendered by `Note::draw()` with the MuseScore playback mark;
-Flutter places that bitmap at `noteheadRect`, preserving filled, hollow, and
-custom notehead contours instead of approximating them with an ellipse.
+from the same laid-out `MasterScore`. Flutter uses each event's tight `rect`
+metadata to recolour the existing raster pixels for a sounding note in place,
+preserving filled, hollow, and custom notehead contours and their antialiasing
+without drawing a second notehead over the page. A legacy transparent
+`noteheadImage`/`noteheadRect` pair is still accepted/emitted for payload
+compatibility with older readers, but the current UI does not place it as an
+overlay.
+Native playback events with a source note also carry its original `sourceTick`
+and, when repeats are expanded, the corresponding first-occurrence
+`clickStartUs`; this mirrors `ScoreView`'s PLAY-mode click on the parent
+`ChordRest`, including delayed grace/ornament events. Pages additionally expose
+`noteTargets` for visible engraved notes that MuseScore merged into another
+MIDI event (such as tied continuations), so the playback click path still
+covers the complete layout.
 Flutter therefore does not reconstruct engraving geometry or playback timing.
 A tuning value is carried alongside the integer MIDI pitch; this preserves
 independently tuned unisons.

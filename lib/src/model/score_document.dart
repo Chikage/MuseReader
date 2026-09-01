@@ -134,6 +134,29 @@ class ScoreGlyph {
   final bool filled;
 }
 
+/// Geometry for an engraved note that can be selected in playback mode.
+///
+/// A visual note is kept separate from [PlaybackEvent] because MuseScore may
+/// merge tied notes (or otherwise omit a standalone MIDI note-on) while the
+/// engraved note remains a valid target for `ScoreView::elementNear`.
+class ScoreNoteTarget {
+  const ScoreNoteTarget({
+    required this.rect,
+    required this.sourceTick,
+    this.clickStartUs,
+  });
+
+  final ScoreRect rect;
+  final int sourceTick;
+  final int? clickStartUs;
+
+  int resolvedClickStartUs(TempoMap tempoMap) {
+    final unrolled = clickStartUs;
+    if (unrolled != null && unrolled >= 0) return unrolled;
+    return tempoMap.tickToUs(sourceTick);
+  }
+}
+
 class ScorePage {
   const ScorePage({
     required this.index,
@@ -143,6 +166,7 @@ class ScorePage {
     this.imageBytes,
     this.pixelWidth,
     this.pixelHeight,
+    this.noteTargets = const [],
   });
 
   final int index;
@@ -158,6 +182,27 @@ class ScorePage {
   /// space shared with note highlight rectangles.
   final int? pixelWidth;
   final int? pixelHeight;
+
+  /// Visual note geometry emitted by the native renderer.  Compatibility
+  /// pages can leave this empty because their note glyphs/events already
+  /// provide the same hit information.
+  final List<ScoreNoteTarget> noteTargets;
+}
+
+class _PlaybackHit {
+  const _PlaybackHit({
+    this.event,
+    required this.timeUs,
+    required this.distance,
+    required this.containsPoint,
+    required this.order,
+  });
+
+  final PlaybackEvent? event;
+  final int timeUs;
+  final double distance;
+  final bool containsPoint;
+  final int order;
 }
 
 class ScoreMeasure {
@@ -275,6 +320,8 @@ class PlaybackEvent {
     this.bank = 0,
     this.startUs,
     this.endUs,
+    this.sourceTick,
+    this.clickStartUs,
     this.pageIndex,
     this.glyphIndex,
     this.pageRect,
@@ -311,17 +358,29 @@ class PlaybackEvent {
   final int bank;
   final int? startUs;
   final int? endUs;
+
+  /// Original engraved Chord/Rest tick for this visual note. Playback events
+  /// can begin later when MuseScore applies grace notes, swing, or a user
+  /// `<Events>` ornament; PLAY-mode clicks still seek the parent ChordRest's
+  /// tick.
+  final int? sourceTick;
+
+  /// Unrolled playback time of [sourceTick], supplied by the native backend
+  /// when repeats are expanded. Compatibility documents can omit it and
+  /// derive the time from [sourceTick] and their local tempo map.
+  final int? clickStartUs;
   final int? pageIndex;
   final int? glyphIndex;
   final ScoreRect? pageRect;
 
-  /// Exact MuseScore-rendered notehead pixels for playback highlighting.
+  /// Legacy MuseScore-rendered notehead pixels for playback highlighting.
   ///
-  /// Native pages are rasterized by MuseScore, so drawing a generic ellipse
-  /// in Flutter cannot reproduce custom notehead shapes or their fractional
-  /// glyph metrics.  When present, this transparent image is placed at
-  /// [noteheadRect] on top of the page image.  Older documents may omit it
-  /// and use the geometric overlay fallback.
+  /// Older readers used this transparent bitmap as a second layer over the
+  /// page.  The current reader keeps the field for payload compatibility but
+  /// recolours the existing page pixels inside the tight [pageRect] (falling
+  /// back to [noteheadRect] when needed), which avoids a doubled antialiased
+  /// edge.  Older documents may omit both fields and use the geometric overlay
+  /// fallback.
   final Uint8List? noteheadImageBytes;
   final ScoreRect? noteheadRect;
 
@@ -337,7 +396,18 @@ class PlaybackEvent {
 
   int resolvedEndUs(TempoMap tempoMap) => endUs ?? tempoMap.tickToUs(endTick);
 
+  int resolvedClickStartUs(TempoMap tempoMap) {
+    final unrolled = clickStartUs;
+    if (unrolled != null && unrolled >= 0) return unrolled;
+    final source = sourceTick;
+    return source == null || source < 0
+        ? resolvedStartUs(tempoMap)
+        : tempoMap.tickToUs(source);
+  }
+
   PlaybackEvent copyWith({
+    int? sourceTick,
+    int? clickStartUs,
     int? pageIndex,
     int? glyphIndex,
     ScoreRect? pageRect,
@@ -362,6 +432,8 @@ class PlaybackEvent {
     bank: bank,
     startUs: startUs,
     endUs: endUs,
+    sourceTick: sourceTick ?? this.sourceTick,
+    clickStartUs: clickStartUs ?? this.clickStartUs,
     pageIndex: pageIndex ?? this.pageIndex,
     glyphIndex: glyphIndex ?? this.glyphIndex,
     pageRect: pageRect ?? this.pageRect,
@@ -371,26 +443,31 @@ class PlaybackEvent {
     cursorEndX: cursorEndX ?? this.cursorEndX,
   );
 
-  Map<String, Object> toMap(TempoMap tempoMap) => {
-    'startTick': startTick,
-    'endTick': endTick,
-    'startUs': resolvedStartUs(tempoMap),
-    'endUs': resolvedEndUs(tempoMap),
-    'pitch': pitch,
-    // Keep the field in every event, including ordinary 12-TET notes.  An
-    // explicit zero lets the native renderer distinguish a tuned voice from
-    // a legacy event when matching note-offs.
-    'tuning': tuning.isFinite ? tuning : 0.0,
-    'noteheadFilled': noteheadFilled,
-    'velocity': velocity,
-    'staff': staff,
-    'voice': voice,
-    'measure': measure,
-    'channel': channel,
-    'program': program,
-    'bank': bank,
-    'page': pageIndex ?? 0,
-  };
+  Map<String, Object> toMap(TempoMap tempoMap) {
+    final result = <String, Object>{
+      'startTick': startTick,
+      'endTick': endTick,
+      'startUs': resolvedStartUs(tempoMap),
+      'endUs': resolvedEndUs(tempoMap),
+      'pitch': pitch,
+      // Keep the field in every event, including ordinary 12-TET notes. An
+      // explicit zero lets the native renderer distinguish a tuned voice from
+      // a legacy event when matching note-offs.
+      'tuning': tuning.isFinite ? tuning : 0.0,
+      'noteheadFilled': noteheadFilled,
+      'velocity': velocity,
+      'staff': staff,
+      'voice': voice,
+      'measure': measure,
+      'channel': channel,
+      'program': program,
+      'bank': bank,
+      'page': pageIndex ?? 0,
+    };
+    if (sourceTick != null) result['sourceTick'] = sourceTick!;
+    if (clickStartUs != null) result['clickStartUs'] = clickStartUs!;
+    return result;
+  }
 }
 
 class ScoreDocument {
@@ -624,6 +701,227 @@ class ScoreDocument {
   List<ScoreCursorSegment> _usableCursorSegments() => cursorSegments
       .where((segment) => segment.isUsable)
       .toList(growable: false);
+
+  /// Return the playable note nearest to a point on an engraved page.
+  ///
+  /// MuseScore's [ScoreView::elementNear] does not require a pointer to land
+  /// exactly on a glyph: it first checks the element bounds and then searches
+  /// a small selection-proximity rectangle around the pointer.  Keep the same
+  /// forgiving behaviour for the read-only playback view.  Native documents
+  /// carry [PlaybackEvent.pageRect] from `Note::pageBoundingRect()` (or the
+  /// legacy notehead rectangle) and the unrolled parent-Chord time.  Their
+  /// page-level [ScoreNoteTarget] list covers visible notes that were merged
+  /// out of the MIDI stream; the glyph fallback keeps documents produced by
+  /// older/native-less parsers clickable as well.
+  /// [proximity] is in the same page units as the rectangles; the UI passes
+  /// the six-pixel MuseScore default after converting it from screen units.
+  PlaybackEvent? eventAtPagePosition(
+    int pageIndex,
+    double x,
+    double y, {
+    double proximity = 6.0,
+  }) =>
+      _playbackHitAtPagePosition(pageIndex, x, y, proximity: proximity)?.event;
+
+  /// Resolve the score-time target used when a note is clicked in playback
+  /// mode.  This includes visual note targets that do not have a standalone
+  /// MIDI event (for example, the continuation of a tie).
+  int? playbackTimeAtPagePosition(
+    int pageIndex,
+    double x,
+    double y, {
+    double proximity = 6.0,
+  }) => _playbackHitAtPagePosition(
+    pageIndex,
+    x,
+    y,
+    proximity: proximity,
+    includeVisualTargets: true,
+  )?.timeUs;
+
+  _PlaybackHit? _playbackHitAtPagePosition(
+    int pageIndex,
+    double x,
+    double y, {
+    required double proximity,
+    bool includeVisualTargets = false,
+  }) {
+    if (pageIndex < 0 ||
+        !x.isFinite ||
+        !y.isFinite ||
+        !proximity.isFinite ||
+        proximity < 0) {
+      return null;
+    }
+
+    // The Flutter viewport passes the page's list position.  Event metadata
+    // may carry a stable page index as well; the matching branch below accepts
+    // either representation without changing the viewport's position
+    // semantics.
+    final pagePosition = _pagePositionForIndex(pageIndex);
+    if (pagePosition < 0) return null;
+
+    final candidates = <_PlaybackHit>[];
+    final page = pages[pagePosition];
+    for (var eventIndex = 0; eventIndex < events.length; eventIndex++) {
+      final event = events[eventIndex];
+      ScoreRect? rect;
+      final eventPage = event.pageIndex ?? 0;
+      final eventRect = _usableEventRect(event);
+      if ((eventPage == pageIndex || eventPage == page.index) &&
+          eventRect != null) {
+        rect = eventRect;
+      } else {
+        // Compatibility/native payloads written before pageRect was added
+        // can still identify an event through the page glyph's eventIndex.
+        for (
+          var glyphIndex = 0;
+          glyphIndex < page.glyphs.length;
+          glyphIndex++
+        ) {
+          final glyph = page.glyphs[glyphIndex];
+          final matchesEvent = glyph.eventIndex == eventIndex;
+          final eventPageMatches =
+              event.pageIndex == null ||
+              event.pageIndex == pageIndex ||
+              event.pageIndex == page.index;
+          final matchesStoredGlyph =
+              eventPageMatches &&
+              event.glyphIndex != null &&
+              event.glyphIndex == glyphIndex;
+          if (glyph.kind == GlyphKind.note &&
+              (matchesEvent || matchesStoredGlyph) &&
+              _isUsableHitRect(glyph.rect)) {
+            rect = glyph.rect;
+            break;
+          }
+        }
+      }
+      if (rect == null || !_isUsableHitRect(rect)) {
+        continue;
+      }
+      final distance = _distanceToRect(rect, x, y);
+      if (_intersectsProximityRect(rect, x, y, proximity)) {
+        candidates.add(
+          _PlaybackHit(
+            event: event,
+            timeUs: event.resolvedClickStartUs(tempoMap),
+            distance: distance,
+            containsPoint: _containsPoint(rect, x, y),
+            order: eventIndex,
+          ),
+        );
+      }
+    }
+
+    if (includeVisualTargets) {
+      // Ties and other playback optimizations can leave a visible Note without
+      // a separate MIDI event.  The native page still exports its engraved
+      // rectangle and parent-Chord time, so include it in the same nearest-hit
+      // ordering as ordinary events.
+      for (
+        var targetIndex = 0;
+        targetIndex < page.noteTargets.length;
+        targetIndex++
+      ) {
+        final target = page.noteTargets[targetIndex];
+        if (target.sourceTick < 0 || !_isUsableHitRect(target.rect)) continue;
+        final distance = _distanceToRect(target.rect, x, y);
+        if (_intersectsProximityRect(target.rect, x, y, proximity)) {
+          candidates.add(
+            _PlaybackHit(
+              timeUs: target.resolvedClickStartUs(tempoMap),
+              distance: distance,
+              containsPoint: _containsPoint(target.rect, x, y),
+              order: events.length + targetIndex,
+            ),
+          );
+        }
+      }
+    }
+    if (candidates.isEmpty) return null;
+
+    // A chord (and a repeated passage) can expose several events at the same
+    // page position.  Direct containment wins first, then distance for
+    // neighbouring notes; the parent-chord playback time is the stable
+    // tie-breaker and mirrors
+    // RepeatList::tick2utick(), which resolves a clicked source note to its
+    // first unrolled occurrence.
+    candidates.sort((left, right) {
+      final containmentOrder = (right.containsPoint ? 1 : 0).compareTo(
+        left.containsPoint ? 1 : 0,
+      );
+      if (containmentOrder != 0) return containmentOrder;
+      final distanceOrder = left.distance.compareTo(right.distance);
+      if (distanceOrder != 0) return distanceOrder;
+      final timeOrder = left.timeUs.compareTo(right.timeUs);
+      if (timeOrder != 0) return timeOrder;
+      return left.order.compareTo(right.order);
+    });
+    return candidates.first;
+  }
+
+  int _pagePositionForIndex(int pageIndex) {
+    if (pageIndex < 0) return -1;
+    return pageIndex < pages.length ? pageIndex : -1;
+  }
+
+  static double _distanceToRect(ScoreRect rect, double x, double y) {
+    final dx = x < rect.left
+        ? rect.left - x
+        : x > rect.right
+        ? x - rect.right
+        : 0.0;
+    final dy = y < rect.top
+        ? rect.top - y
+        : y > rect.bottom
+        ? y - rect.bottom
+        : 0.0;
+    // Keep this distance only for stable nearest-note ordering.  Acceptance
+    // itself uses the asymmetric BSP rectangle in [_intersectsProximityRect].
+    return math.max(dx, dy);
+  }
+
+  static bool _containsPoint(ScoreRect rect, double x, double y) =>
+      x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+
+  static bool _intersectsProximityRect(
+    ScoreRect rect,
+    double x,
+    double y,
+    double proximity,
+  ) {
+    final half = proximity * 0.5;
+    final left = x - half;
+    final top = y - half;
+    final right = x + proximity;
+    final bottom = y + proximity;
+    // This is the same 3w-by-3w rectangle built by MuseScore's
+    // elementsNear(), where w = selectionProximity / 2 / zoom.
+    return rect.right >= left &&
+        rect.left <= right &&
+        rect.bottom >= top &&
+        rect.top <= bottom;
+  }
+
+  static ScoreRect? _usableEventRect(PlaybackEvent event) {
+    final pageRect = event.pageRect;
+    if (pageRect != null && _isUsableHitRect(pageRect)) {
+      return pageRect;
+    }
+    final legacyRect = event.noteheadRect;
+    if (legacyRect != null && _isUsableHitRect(legacyRect)) {
+      return legacyRect;
+    }
+    return null;
+  }
+
+  static bool _isUsableHitRect(ScoreRect rect) =>
+      rect.isFinite &&
+      rect.width > 0 &&
+      rect.height > 0 &&
+      rect.right.isFinite &&
+      rect.bottom.isFinite;
 
   int pageForTick(int tick) {
     if (pages.isEmpty) return 0;

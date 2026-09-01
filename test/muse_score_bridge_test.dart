@@ -99,6 +99,8 @@ void main() {
                 'endTick': 480,
                 'startUs': 0,
                 'endUs': 500000,
+                'sourceTick': 0,
+                'clickStartUs': 0,
                 'pitch': 60,
                 'tuning': 33.3333,
                 'noteheadFilled': false,
@@ -135,6 +137,18 @@ void main() {
                 'pixelWidth': 1488,
                 'pixelHeight': 2105,
                 'image': base64Encode(const [137, 80, 78, 71]),
+                'noteTargets': [
+                  {
+                    'sourceTick': 480,
+                    'clickStartUs': 500000,
+                    'rect': {
+                      'x': 220.0,
+                      'y': 200.0,
+                      'width': 20.0,
+                      'height': 16.0,
+                    },
+                  },
+                ],
               },
             ],
             'endTick': 480,
@@ -156,10 +170,15 @@ void main() {
       expect(document.pages.single.pixelWidth, 1488);
       expect(document.pages.single.pixelHeight, 2105);
       expect(document.pages.single.imageBytes, isNotEmpty);
+      expect(document.pages.single.noteTargets, hasLength(1));
+      expect(document.pages.single.noteTargets.single.sourceTick, 480);
+      expect(document.pages.single.noteTargets.single.clickStartUs, 500000);
       expect(document.events.single.voice, 2);
       expect(document.events.single.tuning, closeTo(33.3333, 0.000001));
       expect(document.events.single.noteheadFilled, isFalse);
       expect(document.events.single.measure, 1);
+      expect(document.events.single.sourceTick, 0);
+      expect(document.events.single.clickStartUs, 0);
       expect(document.events.single.cursorRect!.left, 80);
       expect(document.events.single.cursorEndX, 180);
       expect(document.cursorSegments, hasLength(2));

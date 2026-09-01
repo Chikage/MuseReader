@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
@@ -63,6 +64,26 @@ class _ReaderPageState extends State<ReaderPage> {
     setState(() {});
   }
 
+  /// Mirror MuseScore's PLAY-state mouse handling.  The native score view
+  /// resolves the nearby note, promotes it to its parent chord, and seeks the
+  /// unrolled sequencer tick.  PlaybackEvent.resolvedClickStartUs() carries
+  /// that parent tick on the expanded timeline, so the Flutter equivalent can
+  /// hand the target to the existing audio-aware seek path.
+  void _onScorePageTap(int pageIndex, Offset pagePosition, double proximity) {
+    // MuseScore only treats score clicks specially while ViewState::PLAY is
+    // active.  Pausing/stopping returns the desktop view to NORMAL, so a
+    // reader tap outside active playback must remain inert as well.
+    if (!_playback.isPlaying) return;
+    final target = widget.document.playbackTimeAtPagePosition(
+      pageIndex,
+      pagePosition.dx,
+      pagePosition.dy,
+      proximity: proximity,
+    );
+    if (target == null) return;
+    unawaited(_playback.seekToUs(target));
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -117,6 +138,7 @@ class _ReaderPageState extends State<ReaderPage> {
                 document: widget.document,
                 activeEventIndexes: active,
                 playbackCursor: _playback.cursorPosition,
+                onPageTap: _onScorePageTap,
                 onPageChanged: (page) {
                   if (page != _visiblePage && mounted) {
                     setState(() => _visiblePage = page);
@@ -149,12 +171,15 @@ class _MultiPageScoreViewport extends StatefulWidget {
     required this.document,
     required this.activeEventIndexes,
     required this.playbackCursor,
+    required this.onPageTap,
     required this.onPageChanged,
   });
 
   final ScoreDocument document;
   final Set<int> activeEventIndexes;
   final ScoreCursorPosition? playbackCursor;
+  final void Function(int pageIndex, Offset pagePosition, double proximity)
+  onPageTap;
   final ValueChanged<int> onPageChanged;
 
   @override
@@ -475,6 +500,11 @@ class _MultiPageScoreViewportState extends State<_MultiPageScoreViewport>
                     : null,
                 activePageRects: _activePageRects(index),
                 activeNotes: _activeNotes(index),
+                onTap: (position, proximity) => widget.onPageTap(
+                  index,
+                  position,
+                  proximity / _currentTransformScale,
+                ),
               ),
             ),
         ];
@@ -506,21 +536,52 @@ class _MultiPageScoreViewportState extends State<_MultiPageScoreViewport>
     );
   }
 
-  List<ScoreRect> _activePageRects(int pageIndex) => [
-    for (final eventIndex in widget.activeEventIndexes)
-      if (eventIndex >= 0 && eventIndex < widget.document.events.length)
-        if (widget.document.events[eventIndex].pageIndex == pageIndex &&
-            widget.document.events[eventIndex].pageRect != null)
-          widget.document.events[eventIndex].pageRect!,
-  ];
+  List<ScoreRect> _activePageRects(int pageIndex) {
+    final rects = <ScoreRect>[];
+    for (final eventIndex in widget.activeEventIndexes) {
+      if (eventIndex < 0 || eventIndex >= widget.document.events.length) {
+        continue;
+      }
+      final event = widget.document.events[eventIndex];
+      if (!_eventBelongsToPage(event, pageIndex)) continue;
+      final rect = _usableNoteRect(event);
+      if (rect != null) rects.add(rect);
+    }
+    return rects;
+  }
 
-  List<PlaybackEvent> _activeNotes(int pageIndex) => [
-    for (final eventIndex in widget.activeEventIndexes)
-      if (eventIndex >= 0 && eventIndex < widget.document.events.length)
-        if (widget.document.events[eventIndex].pageIndex == pageIndex &&
-            widget.document.events[eventIndex].pageRect != null)
-          widget.document.events[eventIndex],
-  ];
+  List<PlaybackEvent> _activeNotes(int pageIndex) {
+    final notes = <PlaybackEvent>[];
+    for (final eventIndex in widget.activeEventIndexes) {
+      if (eventIndex < 0 || eventIndex >= widget.document.events.length) {
+        continue;
+      }
+      final event = widget.document.events[eventIndex];
+      if (!_eventBelongsToPage(event, pageIndex)) continue;
+      if (_usableNoteRect(event) != null) notes.add(event);
+    }
+    return notes;
+  }
+
+  /// Tap details are delivered in the page's scene coordinates (the inverse
+  /// of InteractiveViewer's transform). MuseScore's selection proximity is
+  /// specified in physical screen pixels, so divide the base page-space
+  /// tolerance by the current zoom before handing it to the document hit
+  /// tester.
+  double get _currentTransformScale {
+    final scale = _transformationController.value.getMaxScaleOnAxis();
+    return scale.isFinite && scale > 0 ? scale : 1.0;
+  }
+
+  bool _eventBelongsToPage(PlaybackEvent event, int pagePosition) {
+    final eventPage = event.pageIndex;
+    if (eventPage == null) return pagePosition == 0;
+    if (eventPage == pagePosition) return true;
+    if (pagePosition < 0 || pagePosition >= widget.document.pages.length) {
+      return false;
+    }
+    return eventPage == widget.document.pages[pagePosition].index;
+  }
 }
 
 class _PageViewport extends StatelessWidget {
@@ -532,6 +593,7 @@ class _PageViewport extends StatelessWidget {
     required this.playbackCursor,
     required this.activePageRects,
     required this.activeNotes,
+    required this.onTap,
   });
 
   final ScorePage page;
@@ -541,6 +603,7 @@ class _PageViewport extends StatelessWidget {
   final ScoreRect? playbackCursor;
   final List<ScoreRect> activePageRects;
   final List<PlaybackEvent> activeNotes;
+  final void Function(Offset position, double proximity)? onTap;
 
   @override
   Widget build(BuildContext context) {
@@ -566,13 +629,35 @@ class _PageViewport extends StatelessWidget {
               playbackCursor: playbackCursor,
             ),
           );
+    final safePageHeight = page.height <= 0 ? 1.0 : page.height;
     return Semantics(
       container: true,
       label: '第 ${pageNumber + 1} 页',
-      child: Material(
-        elevation: 3,
-        color: Colors.white,
-        child: SizedBox(width: width, height: height, child: content),
+      hint: '播放时点击音符可跳转',
+      child: GestureDetector(
+        key: ValueKey<String>('score-page-$pageNumber'),
+        behavior: HitTestBehavior.opaque,
+        onTapUp: onTap == null
+            ? null
+            : (details) {
+                final local = details.localPosition;
+                onTap!(
+                  Offset(
+                    local.dx * safePageWidth / width,
+                    local.dy * safePageHeight / height,
+                  ),
+                  // MuseScore's default selection proximity is six screen
+                  // pixels.  Convert it to the page coordinate space before
+                  // hit-testing so A4 native pages (which are much wider
+                  // than the Flutter viewport) remain equally forgiving.
+                  6.0 * safePageWidth / width,
+                );
+              },
+        child: Material(
+          elevation: 3,
+          color: Colors.white,
+          child: SizedBox(width: width, height: height, child: content),
+        ),
       ),
     );
   }
@@ -601,42 +686,76 @@ class _NativePageStack extends StatelessWidget {
     final safePageHeight = page.height <= 0 ? 1.0 : page.height;
     final scaleX = width / safePageWidth;
     final scaleY = height / safePageHeight;
-    final noteheadLayers = <Widget>[];
-    for (var index = 0; index < activeNotes.length; index++) {
-      final note = activeNotes[index];
-      final image = note.noteheadImageBytes;
-      final rect = note.noteheadRect;
-      if (image == null || image.isEmpty || rect == null || !rect.isFinite) {
-        continue;
+    final pageRect = Rect.fromLTWH(0, 0, width, height);
+    final recoloredRects = <Rect>[];
+    final fallbackNotes = <PlaybackEvent>[];
+    final fallbackRects = <ScoreRect>[];
+    for (final note in activeNotes) {
+      // The native bridge supplies the note's tight page rectangle.  Repaint
+      // the *existing page pixels* in that rectangle with a colour filter rather
+      // than placing a second notehead bitmap over the rasterized page.  The
+      // latter leaves the original antialiased black edge underneath and
+      // makes the playback mark look like a doubled note.
+      // pageRect is MuseScore's actual Note::bbox and is tighter than the
+      // padded legacy noteheadRect (the latter was sized for a transparent
+      // bitmap's antialiasing margin).  Prefer the tight rectangle so nearby
+      // staff/ledger pixels are not recoloured along with the note.
+      final sourceRect = _usableNoteRect(note);
+      final scaled = sourceRect == null
+          ? null
+          : Rect.fromLTWH(
+              sourceRect.left * scaleX,
+              sourceRect.top * scaleY,
+              sourceRect.width * scaleX,
+              sourceRect.height * scaleY,
+            );
+      final clipped = scaled == null || !scaled.isFinite
+          ? null
+          : scaled.intersect(pageRect);
+      if (clipped != null &&
+          clipped.isFinite &&
+          clipped.width > 0 &&
+          clipped.height > 0) {
+        recoloredRects.add(clipped);
+      } else {
+        // Keep the geometric painter as a last-resort compatibility path for
+        // old/partial native payloads that do not contain usable geometry.
+        fallbackNotes.add(note);
+        final rect = _usableNoteRect(note);
+        if (rect != null &&
+            rect.isFinite &&
+            rect.width > 0 &&
+            rect.height > 0) {
+          fallbackRects.add(rect);
+        }
       }
-      final scaled = Rect.fromLTWH(
-        rect.left * scaleX,
-        rect.top * scaleY,
-        rect.width * scaleX,
-        rect.height * scaleY,
-      );
-      if (!scaled.isFinite || scaled.width <= 0 || scaled.height <= 0) {
-        continue;
-      }
-      noteheadLayers.add(
-        Positioned(
-          key: ValueKey<Object>(note),
-          left: scaled.left,
-          top: scaled.top,
-          width: scaled.width,
-          height: scaled.height,
-          child: IgnorePointer(
-            child: Image.memory(
-              image,
-              fit: BoxFit.fill,
-              filterQuality: FilterQuality.high,
-              gaplessPlayback: true,
-              excludeFromSemantics: true,
-            ),
-          ),
-        ),
-      );
     }
+
+    final recoloredPage = recoloredRects.isEmpty
+        ? null
+        : Positioned.fill(
+            child: IgnorePointer(
+              child: ClipPath(
+                clipBehavior: Clip.hardEdge,
+                clipper: _NoteRectsClipper(recoloredRects),
+                child: ColorFiltered(
+                  // Paint the same rasterized page through a color filter only
+                  // inside the note clips.  This keeps the original page
+                  // pixels underneath the antialiased edge without drawing a
+                  // second notehead shape.
+                  colorFilter: _playbackNoteColorFilter,
+                  child: Image.memory(
+                    page.imageBytes!,
+                    width: width,
+                    height: height,
+                    fit: BoxFit.fill,
+                    filterQuality: FilterQuality.high,
+                    gaplessPlayback: true,
+                  ),
+                ),
+              ),
+            ),
+          );
 
     return Stack(
       clipBehavior: Clip.hardEdge,
@@ -649,15 +768,15 @@ class _NativePageStack extends StatelessWidget {
           filterQuality: FilterQuality.high,
           gaplessPlayback: true,
         ),
-        ...noteheadLayers,
+        ?recoloredPage,
         Positioned.fill(
           child: IgnorePointer(
             child: CustomPaint(
               painter: _PlaybackOverlayPainter(
                 pageWidth: page.width,
                 pageHeight: page.height,
-                rects: activePageRects,
-                notes: activeNotes,
+                rects: activeNotes.isEmpty ? activePageRects : fallbackRects,
+                notes: fallbackNotes,
                 cursor: playbackCursor,
                 color: museScorePlaybackColor,
               ),
@@ -666,6 +785,79 @@ class _NativePageStack extends StatelessWidget {
         ),
       ],
     );
+  }
+}
+
+ScoreRect? _usableNoteRect(PlaybackEvent note) {
+  final pageRect = note.pageRect;
+  if (pageRect != null &&
+      pageRect.isFinite &&
+      pageRect.width > 0 &&
+      pageRect.height > 0) {
+    return pageRect;
+  }
+  final legacyRect = note.noteheadRect;
+  if (legacyRect != null &&
+      legacyRect.isFinite &&
+      legacyRect.width > 0 &&
+      legacyRect.height > 0) {
+    return legacyRect;
+  }
+  return null;
+}
+
+/// MuseScore's page image is opaque, so this matrix can replace the grayscale
+/// ink under an active note with the playback blue while preserving the
+/// antialiased edge between ink and paper.  For a grayscale source value
+/// [luma], the result is `white * luma + playbackBlue * (1 - luma)`.
+const _playbackNoteColorFilter = ColorFilter.matrix(<double>[
+  0.299,
+  0.587,
+  0.114,
+  0,
+  0,
+  0.180572549,
+  0.354501961,
+  0.068847059,
+  0,
+  101,
+  0.075043137,
+  0.14732549,
+  0.028611765,
+  0,
+  191,
+  0,
+  0,
+  0,
+  1,
+  0,
+]);
+
+/// Clips the filtered page copy to the union of all currently sounding
+/// notehead rectangles. Keeping this as one clip/filter pair avoids creating a
+/// widget and a separate composited layer for every note in a chord.
+class _NoteRectsClipper extends CustomClipper<Path> {
+  const _NoteRectsClipper(this.rects);
+
+  final List<Rect> rects;
+
+  @override
+  Path getClip(Size size) {
+    final path = Path();
+    for (final rect in rects) {
+      if (rect.isFinite && !rect.isEmpty) path.addRect(rect);
+    }
+    return path;
+  }
+
+  @override
+  bool shouldReclip(covariant _NoteRectsClipper oldClipper) {
+    if (identical(rects, oldClipper.rects)) return false;
+    if (rects.length != oldClipper.rects.length) return true;
+    for (var index = 0; index < rects.length; index++) {
+      if (rects[index] != oldClipper.rects[index]) return true;
+    }
+    return false;
   }
 }
 
@@ -694,17 +886,11 @@ class _PlaybackOverlayPainter extends CustomPainter {
     final pageRect = Rect.fromLTWH(0, 0, size.width, size.height);
 
     // MuseScore marks every sounding note with the voice colour before it
-    // paints the translucent position cursor.  Native pages are rasterized,
-    // so reproduce the notehead/stem silhouette in the small note bounding
-    // rectangles supplied by the bridge.
+    // paints the translucent position cursor.  Native pages with usable
+    // rectangles are recoloured by _NativePageStack; this painter is only the
+    // geometric compatibility path for older/partial payloads.
     for (final note in notes) {
-      // New native events carry the exact MuseScore glyph as a transparent
-      // image layer.  Leave those pixels to _NativePageStack so we do not
-      // add a second, approximate ellipse underneath them.
-      if (note.noteheadImageBytes != null && note.noteheadRect != null) {
-        continue;
-      }
-      final noteRect = note.pageRect;
+      final noteRect = _usableNoteRect(note);
       if (noteRect == null || !noteRect.isFinite) continue;
       _drawMarkedNote(
         canvas,
@@ -718,8 +904,9 @@ class _PlaybackOverlayPainter extends CustomPainter {
       );
     }
     // Keep compatibility with callers that only have rectangles (documents
-    // produced by an older bridge).  These are deliberately subtle and do
-    // not recreate the old rounded selection boxes.
+    // produced by an older bridge).  _NativePageStack passes only geometry
+    // that could not be handled by the in-place filter, so this branch cannot
+    // paint a second mark for notes that were recoloured above.
     if (notes.isEmpty) {
       final mark = Paint()..color = color;
       for (final rect in rects) {

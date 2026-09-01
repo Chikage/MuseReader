@@ -17,6 +17,9 @@ extern "C" {
 
 /**
  * Opens a score and returns a UTF-8 JSON document owned by the engine.
+ * Playback events include their original source tick and page-local note
+ * rectangles; pages also expose visual note targets that may not have a
+ * standalone MIDI event (for example, tied continuations).
  * The caller must release it with muse_reader_free_json().
  */
 MUSE_READER_EXPORT const char* muse_reader_open_json(const char* utf8_path);
