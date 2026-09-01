@@ -1,8 +1,52 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
     id("dev.flutter.flutter-gradle-plugin")
 }
+
+// Keep signing secrets out of the repository. Values may be supplied through
+// Gradle/local properties or the existing adjacent JustPiano signing config.
+val localProperties = Properties().apply {
+    val file = rootProject.file("local.properties")
+    if (file.isFile) {
+        file.inputStream().use(::load)
+    }
+}
+val adjacentSigningProperties = Properties().apply {
+    val file = rootProject.projectDir.parentFile?.parentFile
+        ?.resolve("JustPiano/JP-Android/gradle.properties")
+    if (file?.isFile == true) {
+        file.inputStream().use(::load)
+    }
+}
+
+fun signingProperty(vararg names: String): String? =
+    names.firstNotNullOfOrNull { name ->
+        providers.gradleProperty(name).orNull
+            ?: localProperties.getProperty(name)
+            ?: adjacentSigningProperties.getProperty(name)
+            ?: providers.environmentVariable(name).orNull
+    }
+
+fun requiredSigningProperty(value: String?, description: String): String =
+    value?.takeIf(String::isNotBlank)
+        ?: error("Release signing requires $description")
+
+val releaseStoreFile = rootProject.file("key.jks")
+check(releaseStoreFile.isFile) {
+    "Release signing requires ${releaseStoreFile.absolutePath}"
+}
+val releaseStorePassword = requiredSigningProperty(
+    signingProperty("RELEASE_STORE_PASSWORD", "sign.store.password"),
+    "RELEASE_STORE_PASSWORD or sign.store.password",
+)
+val releaseKeyAlias = signingProperty("RELEASE_KEY_ALIAS", "sign.key.alias") ?: "as2134u"
+val releaseKeyPassword = requiredSigningProperty(
+    signingProperty("RELEASE_KEY_PASSWORD", "sign.key.password") ?: releaseStorePassword,
+    "RELEASE_KEY_PASSWORD or sign.key.password",
+)
 
 val museReaderRoot = rootProject.projectDir.parentFile
 val museScoreSource = project.findProperty("museScoreSourceDir")?.toString()
@@ -69,11 +113,18 @@ android {
         }
     }
 
+    signingConfigs {
+        create("release") {
+            storeFile = releaseStoreFile
+            storePassword = releaseStorePassword
+            keyAlias = releaseKeyAlias
+            keyPassword = releaseKeyPassword
+        }
+    }
+
     buildTypes {
         release {
-            // TODO: Add your own signing config for the release build.
-            // Signing with the debug keys for now, so `flutter run --release` works.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("release")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",

@@ -65,7 +65,7 @@ MuseScore `<Events>` 的装饰音/分解播放事件也会保留其相对音高�
 - `build/releases/MuseReader-ios-arm64-unsigned.ipa`
 - `ios/Frameworks/MuseReaderEngine.framework`
 
-可通过 `MUSESCORE_SOURCE_DIR` 覆盖源码位置。Android release 当前沿用 Flutter 模板的调试签名；iOS IPA 未签名。上架或真机分发前必须配置正式 Android keystore 和 Apple Team/Provisioning Profile 后重新签名构建。
+可通过 `MUSESCORE_SOURCE_DIR` 覆盖源码位置。Android release 使用 `android/key.jks`，签名密码从本地 Gradle 配置读取且不写入仓库；iOS IPA 未签名。上架或真机分发前仍必须确认 Android keystore 和 Apple Team/Provisioning Profile 符合分发要求后重新签名构建。
 
 等价的最终 Flutter 命令为：
 
