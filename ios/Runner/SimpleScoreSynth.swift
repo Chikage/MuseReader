@@ -6,6 +6,7 @@ final class SimpleScoreSynth {
     let startUs: Double
     let endUs: Double
     let pitch: Int
+    let tuning: Double
     let velocity: Double
   }
 
@@ -25,11 +26,18 @@ final class SimpleScoreSynth {
         let end = (raw["endUs"] as? NSNumber)?.doubleValue
       else { return nil }
       let pitch = (raw["pitch"] as? NSNumber)?.intValue ?? 60
+      let rawTuning = (raw["tuning"] as? NSNumber)?.doubleValue
+        ?? (raw["cents"] as? NSNumber)?.doubleValue
+        ?? 0.0
+      let tuning = rawTuning.isFinite
+        ? min(1_000_000.0, max(-1_000_000.0, rawTuning))
+        : 0.0
       let velocity = (raw["velocity"] as? NSNumber)?.doubleValue ?? 80
       return ToneEvent(
         startUs: start,
         endUs: max(start + 1, end),
-        pitch: pitch,
+        pitch: min(127, max(0, pitch)),
+        tuning: tuning,
         velocity: velocity
       )
     }
@@ -150,7 +158,14 @@ final class SimpleScoreSynth {
       let attack = min(1.0, elapsed / 12_000.0)
       let release = min(1.0, (duration - elapsed) / 35_000.0)
       let envelope = min(attack, release)
-      let frequency = 440.0 * pow(2.0, Double(event.pitch - 69) / 12.0)
+      // MuseScore's Note::tuning is a per-note cent offset.  Include it in
+      // the oscillator frequency instead of applying a channel-wide bend so
+      // simultaneous notes can remain independently tuned.
+      let frequency = 440.0 * pow(
+        2.0,
+        (Double(event.pitch - 69) * 100.0 + event.tuning) / 1200.0
+      )
+      guard frequency.isFinite else { continue }
       sum += sin(2.0 * .pi * frequency * elapsed / 1_000_000.0) *
         envelope * event.velocity / 127.0
     }

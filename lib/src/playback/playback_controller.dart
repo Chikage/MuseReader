@@ -15,9 +15,11 @@ class PlaybackController extends ChangeNotifier {
   int _positionUs = 0;
   double _speed = 1.0;
   bool _isPlaying = false;
+  bool _cursorVisible = false;
 
   bool get isPlaying => _isPlaying;
   double get speed => _speed;
+  bool get cursorVisible => _cursorVisible;
 
   int get positionUs {
     if (!_isPlaying || _clock == null) return _positionUs;
@@ -30,11 +32,15 @@ class PlaybackController extends ChangeNotifier {
 
   int get positionTick => document.tempoMap.usToTick(positionUs, speed: 1.0);
 
+  ScoreCursorPosition? get cursorPosition =>
+      _cursorVisible ? document.cursorForTime(positionUs) : null;
+
   int get durationUs => document.durationUs;
 
   double get progress => durationUs == 0 ? 0 : positionUs / durationUs;
 
-  int get currentPage => document.pageForTime(positionUs);
+  int get currentPage =>
+      cursorPosition?.pageIndex ?? document.pageForTime(positionUs);
 
   int? get currentMeasure {
     final currentUs = positionUs;
@@ -71,6 +77,7 @@ class PlaybackController extends ChangeNotifier {
     _basePositionUs = _positionUs;
     _clock = Stopwatch()..start();
     _isPlaying = true;
+    _cursorVisible = true;
     _timer?.cancel();
     _timer = Timer.periodic(const Duration(milliseconds: 16), (_) {
       _syncPosition();
@@ -87,6 +94,7 @@ class PlaybackController extends ChangeNotifier {
     if (!_isPlaying) return;
     _syncPosition();
     _isPlaying = false;
+    _cursorVisible = false;
     _clock?.stop();
     _timer?.cancel();
     _timer = null;
@@ -99,12 +107,14 @@ class PlaybackController extends ChangeNotifier {
   Future<void> restart() async {
     await pause();
     _positionUs = 0;
+    _cursorVisible = false;
     notifyListeners();
   }
 
   Future<void> seekToUs(int microseconds) async {
     final next = microseconds.clamp(0, durationUs).toInt();
     _positionUs = next;
+    _cursorVisible = true;
     if (_isPlaying) {
       _basePositionUs = next;
       _clock = Stopwatch()..start();
@@ -140,6 +150,7 @@ class PlaybackController extends ChangeNotifier {
     if (next >= durationUs) {
       _positionUs = durationUs;
       _isPlaying = false;
+      _cursorVisible = false;
       _clock?.stop();
       _timer?.cancel();
       _timer = null;

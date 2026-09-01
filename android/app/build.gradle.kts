@@ -20,7 +20,7 @@ val museReaderCmakeArgs = listOf(
     "-DMUSE_READER_QTBASE_SOURCE_DIR=$museReaderQtBaseSource",
     "-DQt5_DIR=$museReaderQt/lib/cmake/Qt5",
     "-DCMAKE_PREFIX_PATH=$museReaderQt",
-    "-DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH",
+    "-DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=NEVER",
     "-DANDROID_STL=c++_shared",
 )
 

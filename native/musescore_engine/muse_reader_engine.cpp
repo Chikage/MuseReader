@@ -32,17 +32,21 @@
 #include <deque>
 #include <map>
 #include <memory>
+#include <tuple>
 
 #include "chord.h"
 #include "element.h"
 #include "event.h"
+#include "instrument.h"
 #include "measure.h"
 #include "mscore.h"
 #include "musescoreCore.h"
 #include "note.h"
 #include "page.h"
 #include "repeatlist.h"
+#include "segment.h"
 #include "score.h"
+#include "staff.h"
 #include "synthesizerstate.h"
 #include "system.h"
 #include "tempo.h"
@@ -274,13 +278,201 @@ struct PendingNote {
   int program;
   int bank;
   int pitch;
+  // MuseScore stores Note::tuning as a cent offset from the integer MIDI
+  // pitch.  Keep it on the pending note so the JSON interval can be replayed
+  // by the bundled FluidSynth voice without collapsing microtonal unisons.
+  double tuning = 0.0;
   int velocity;
   int staff;
   int voice;
   int measure;
   int page;
   QRectF page_rect;
+  QRectF cursor_rect;
+  qreal cursor_end_x = 0.0;
+  bool has_cursor = false;
 };
+
+// Geometry copied from ScoreView::moveCursor() in MuseScore 3.6.2.  The
+// cursor is kept as a set of tick intervals because its x coordinate is
+// linearly interpolated between visible chord/rest segments.
+struct CursorGeometry {
+  int start_tick = 0;
+  int end_tick = 0;
+  int page = 0;
+  QRectF rect;
+  qreal end_x = 0.0;
+};
+
+QJsonObject cursor_json(const Ms::MasterScore* score,
+                        const CursorGeometry& cursor) {
+  QJsonObject result;
+  result.insert("startTick", cursor.start_tick);
+  result.insert("endTick", cursor.end_tick);
+  result.insert("page", cursor.page);
+  QJsonObject rect;
+  rect.insert("x", cursor.rect.x());
+  rect.insert("y", cursor.rect.y());
+  rect.insert("width", cursor.rect.width());
+  rect.insert("height", cursor.rect.height());
+  result.insert("rect", rect);
+  result.insert("endX", cursor.end_x);
+  if (score) {
+    const qreal start_time = score->utick2utime(cursor.start_tick);
+    const qreal end_time = score->utick2utime(cursor.end_tick);
+    if (qIsFinite(start_time) && qIsFinite(end_time)) {
+      result.insert("startUs", qRound64(start_time * 1000000.0));
+      result.insert("endUs", qRound64(end_time * 1000000.0));
+    }
+  }
+  return result;
+}
+
+std::vector<CursorGeometry> build_cursor_geometry(Ms::MasterScore* score) {
+  std::vector<CursorGeometry> result;
+  if (!score) return result;
+
+  const qreal spatium = score->spatium();
+  const qreal mag = spatium / Ms::SPATIUM20;
+  const qreal cursor_width =
+      spatium * 2.0 +
+      score->scoreFont()->width(Ms::SymId::noteheadBlack, mag);
+
+  for (Ms::Measure* measure = score->firstMeasure(); measure;
+       measure = measure->nextMeasure()) {
+    Ms::System* system = measure->system();
+    Ms::Page* page = system ? system->page() : nullptr;
+    if (!system || !page || system->staves()->isEmpty()) continue;
+
+    const QRectF page_box = page->abbox();
+    qreal y = system->staffYpage(0) + page->pos().y();
+    qreal last_staff_bottom = 0.0;
+    for (int staff = 0; staff < score->nstaves(); ++staff) {
+      if (staff >= system->staves()->size()) break;
+      Ms::SysStaff* sys_staff = system->staff(staff);
+      if (!sys_staff || !sys_staff->show() || !score->staff(staff)->show())
+        continue;
+      // This is intentionally the same bottom-of-SysStaff calculation used
+      // by PositionCursor::move(), including its system-relative coordinate.
+      last_staff_bottom = sys_staff->bbox().bottom();
+    }
+    if (last_staff_bottom <= 0.0) {
+      last_staff_bottom = system->bbox().bottom();
+    }
+    const qreal cursor_height = 6.0 * spatium + last_staff_bottom;
+    y -= 3.0 * spatium;
+    y -= page_box.top();
+
+    const int page_index = qMax(0, score->pageIdx(page));
+    Ms::Segment* segment = measure->first(Ms::SegmentType::ChordRest);
+    while (segment) {
+      const int start_tick = segment->tick().ticks();
+      const qreal x1 = segment->pagePos().x() - page_box.left() - spatium;
+      Ms::Segment* next = segment->next(Ms::SegmentType::ChordRest);
+      while (next && !next->visible()) {
+        next = next->next(Ms::SegmentType::ChordRest);
+      }
+
+      int end_tick = measure->endTick().ticks();
+      qreal x2 = measure->pagePos().x() + measure->width() - page_box.left();
+      if (next) {
+        end_tick = next->tick().ticks();
+        x2 = next->pagePos().x() - page_box.left();
+      } else {
+        // Measure::width() includes courtesy elements; ScoreView uses the
+        // explicit end-barline segment whenever it is available.
+        Ms::Segment* end_bar = measure->findSegment(
+            Ms::SegmentType::EndBarLine,
+            measure->tick() + measure->ticks());
+        if (end_bar) x2 = end_bar->pagePos().x() - page_box.left();
+      }
+      if (end_tick > start_tick) {
+        CursorGeometry cursor;
+        cursor.start_tick = start_tick;
+        cursor.end_tick = end_tick;
+        cursor.page = page_index;
+        cursor.rect = QRectF(x1, y, cursor_width, cursor_height);
+        cursor.end_x = x2 - spatium;
+        result.push_back(cursor);
+      }
+      segment = next;
+    }
+  }
+  std::sort(result.begin(), result.end(), [](const CursorGeometry& left,
+                                             const CursorGeometry& right) {
+    if (left.start_tick != right.start_tick)
+      return left.start_tick < right.start_tick;
+    if (left.page != right.page) return left.page < right.page;
+    return left.end_tick < right.end_tick;
+  });
+  return result;
+}
+
+const CursorGeometry* cursor_for_tick(
+    const std::vector<CursorGeometry>& cursors,
+    int tick,
+    int page_hint = -1) {
+  const CursorGeometry* fallback = nullptr;
+  for (const CursorGeometry& cursor : cursors) {
+    if (page_hint >= 0 && cursor.page != page_hint) continue;
+    if (tick >= cursor.start_tick && tick < cursor.end_tick) return &cursor;
+    if (tick < cursor.start_tick && !fallback) fallback = &cursor;
+  }
+  return fallback;
+}
+
+QRectF cursor_rect_at_tick(const CursorGeometry& cursor, int tick) {
+  if (cursor.end_tick <= cursor.start_tick) return cursor.rect;
+  const qreal amount = qBound(
+      0.0,
+      static_cast<qreal>(tick - cursor.start_tick) /
+          static_cast<qreal>(cursor.end_tick - cursor.start_tick),
+      1.0);
+  QRectF rect = cursor.rect;
+  rect.moveLeft(cursor.rect.left() +
+                (cursor.end_x - cursor.rect.left()) * amount);
+  return rect;
+}
+
+// RepeatList stores both the original-score start tick and the unrolled
+// playback start tick.  Expand the laid-out cursor intervals into that same
+// unrolled coordinate space so a repeated passage does not use the geometry
+// of a later original measure with the same numeric tick.
+std::vector<CursorGeometry> expand_cursor_geometry(
+    Ms::MasterScore* score,
+    const std::vector<CursorGeometry>& original) {
+  if (!score || original.empty() || score->repeatList().isEmpty()) {
+    return original;
+  }
+
+  std::vector<CursorGeometry> result;
+  for (const Ms::RepeatSegment* repeat : score->repeatList()) {
+    if (!repeat || repeat->len() <= 0) continue;
+    const int source_start = repeat->tick;
+    const int source_end = source_start + repeat->len();
+    for (const CursorGeometry& cursor : original) {
+      const int clipped_start = qMax(cursor.start_tick, source_start);
+      const int clipped_end = qMin(cursor.end_tick, source_end);
+      if (clipped_end <= clipped_start) continue;
+
+      CursorGeometry expanded = cursor;
+      expanded.start_tick = repeat->utick + (clipped_start - source_start);
+      expanded.end_tick = repeat->utick + (clipped_end - source_start);
+      expanded.rect = cursor_rect_at_tick(cursor, clipped_start);
+      expanded.end_x = cursor_rect_at_tick(cursor, clipped_end).left();
+      result.push_back(expanded);
+    }
+  }
+  if (result.empty()) return original;
+  std::sort(result.begin(), result.end(), [](const CursorGeometry& left,
+                                             const CursorGeometry& right) {
+    if (left.start_tick != right.start_tick)
+      return left.start_tick < right.start_tick;
+    if (left.page != right.page) return left.page < right.page;
+    return left.end_tick < right.end_tick;
+  });
+  return result;
+}
 
 QJsonObject note_json(
     Ms::MasterScore* score,
@@ -294,6 +486,7 @@ QJsonObject note_json(
   result.insert("startUs", qRound64(start_time * 1000000.0));
   result.insert("endUs", qRound64(end_time * 1000000.0));
   result.insert("pitch", note.pitch);
+  result.insert("tuning", Ms::normalizedPlayEventTuning(note.tuning));
   result.insert("velocity", note.velocity);
   result.insert("channel", note.channel);
   result.insert("program", note.program);
@@ -309,6 +502,15 @@ QJsonObject note_json(
     rect.insert("width", note.page_rect.width());
     rect.insert("height", note.page_rect.height());
     result.insert("rect", rect);
+  }
+  if (note.has_cursor && !note.cursor_rect.isEmpty()) {
+    QJsonObject cursor;
+    cursor.insert("x", note.cursor_rect.x());
+    cursor.insert("y", note.cursor_rect.y());
+    cursor.insert("width", note.cursor_rect.width());
+    cursor.insert("height", note.cursor_rect.height());
+    result.insert("cursor", cursor);
+    result.insert("cursorEndX", note.cursor_end_x);
   }
   return result;
 }
@@ -327,6 +529,15 @@ QJsonObject open_with_musescore(const char* utf8_path) {
   // Layout is the source of truth for every page image. No Flutter-side
   // geometry is used when this backend is enabled.
   score.doLayout();
+  // Keep the original geometry for note anchors, then expand a second copy
+  // onto the same unrolled tick axis used by renderMidi().
+  // MasterScore exposes RepeatList through a const accessor; setting the
+  // expansion mode lets that accessor lazily build the unrolled segments.
+  score.setExpandRepeats(true);
+  const std::vector<CursorGeometry> cursor_geometry =
+      build_cursor_geometry(&score);
+  const std::vector<CursorGeometry> playback_cursor_geometry =
+      expand_cursor_geometry(&score, cursor_geometry);
 
   QJsonObject document;
   document.insert("title", score.metaTags().value("workTitle"));
@@ -380,15 +591,39 @@ QJsonObject open_with_musescore(const char* utf8_path) {
   }
   document.insert("measures", measures);
 
+  QJsonArray cursor_segments;
+  for (const CursorGeometry& cursor : playback_cursor_geometry) {
+    cursor_segments.append(cursor_json(&score, cursor));
+  }
+  document.insert("cursorSegments", cursor_segments);
+
   // renderMidi(..., expandRepeats=true, ...) is the canonical unrolled event
   // stream. Its map key is a playback tick; utick2utime applies tempo changes,
   // pauses and repeat offsets exactly as the MuseScore sequencer does.
+  //
+  // renderMidi intentionally emits only time-varying MIDI actions.  The
+  // initial program/bank from each instrument lives in Channel::initList()
+  // (and is normally sent by Seq::initInstruments()), so it is absent from
+  // EventMap.  Seed the state from the rebuilt playback mapping before
+  // consuming EventMap; otherwise every channel silently starts at GM piano.
+  score.rebuildMidiMapping();
   Ms::EventMap midi_events;
   score.renderMidi(&midi_events, false, true, Ms::defaultState);
-  using NoteKey = std::pair<int, int>;
+  // EventMap::fixupMIDI uses the same quantized tuning key when it keeps
+  // overlapping voices apart.  Mirror that key here so note-offs for two
+  // equal MIDI pitches with different cent offsets are paired correctly.
+  using NoteKey = std::tuple<int, int, qint64>;
   std::map<NoteKey, std::deque<PendingNote>> active;
   std::map<int, int> programs;
   std::map<int, int> banks;
+  for (const Ms::MidiMapping& mapping : score.midiMapping()) {
+    const Ms::Channel* channel = mapping.articulation();
+    if (!channel || channel->channel() < 0) continue;
+    programs[channel->channel()] =
+        qBound(0, channel->program(), 127);
+    banks[channel->channel()] =
+        qBound(0, channel->bank(), 16383);
+  }
   QJsonArray events;
   int end_tick = score.repeatList().ticks();
   if (end_tick <= 0 && score.lastMeasure()) {
@@ -414,14 +649,26 @@ QJsonObject open_with_musescore(const char* utf8_path) {
         continue;
       }
     }
+    // Imported MIDI streams can contain a native ME_PROGRAM event instead of
+    // MuseScore's CTRL_PROGRAM controller representation.  Keep both forms
+    // in the same per-channel state machine.
+    if (event.type() == Ms::ME_PROGRAM) {
+      programs[event.channel()] = qBound(0, event.dataB(), 127);
+      continue;
+    }
     const int pitch = event.pitch();
-    const NoteKey key(event.channel(), pitch);
+    const double tuning = event.hasTuning() ? event.tuning() : 0.0;
+    const NoteKey key(event.channel(), pitch,
+                      Ms::playEventTuningKey(tuning));
     if (event.type() == Ms::ME_NOTEON && event.velo() > 0) {
       int staff = event.getOriginatingStaff();
       int measure_number = 1;
       int voice = 0;
       int page = 0;
       QRectF page_rect;
+      QRectF cursor_rect;
+      qreal cursor_end_x = 0.0;
+      bool has_cursor = false;
       if (event.note() && event.note()->chord() && event.note()->chord()->measure()) {
         Ms::Measure* measure = event.note()->chord()->measure();
         staff = qMax(0, event.note()->staffIdx());
@@ -434,6 +681,17 @@ QJsonObject open_with_musescore(const char* utf8_path) {
                           ->pageBoundingRect()
                           .translated(-note_page->abbox().topLeft())
                           .normalized();
+          if (event.note()->chord()->segment()) {
+            const int original_tick =
+                event.note()->chord()->segment()->tick().ticks();
+            const CursorGeometry* geometry =
+                cursor_for_tick(cursor_geometry, original_tick, page);
+            if (geometry) {
+              cursor_rect = cursor_rect_at_tick(*geometry, original_tick);
+              cursor_end_x = geometry->end_x;
+              has_cursor = true;
+            }
+          }
         }
       }
       active[key].push_back(
@@ -442,12 +700,16 @@ QJsonObject open_with_musescore(const char* utf8_path) {
            programs[event.channel()],
            banks[event.channel()],
            pitch,
+           Ms::normalizedPlayEventTuning(tuning),
            event.velo(),
            staff,
            voice,
            measure_number,
            page,
-           page_rect});
+           page_rect,
+           cursor_rect,
+           cursor_end_x,
+           has_cursor});
     } else if (event.type() == Ms::ME_NOTEOFF ||
                (event.type() == Ms::ME_NOTEON && event.velo() == 0)) {
       auto open = active.find(key);

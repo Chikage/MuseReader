@@ -109,6 +109,10 @@ class ScoreParser {
       rests: parsed.rests,
       staffCount: parsed.staffCount,
     );
+    final cursorSegments = _buildCursorSegments(
+      measures: parsed.measures,
+      staffCount: parsed.staffCount,
+    );
 
     final eventPageAndGlyph = <int, ({int page, int glyph})>{};
     for (final page in pages) {
@@ -124,9 +128,13 @@ class ScoreParser {
         .entries
         .map((entry) {
           final location = eventPageAndGlyph[entry.key];
+          final pageRect = location == null
+              ? null
+              : pages[location.page].glyphs[location.glyph].rect;
           return entry.value.copyWith(
             pageIndex: location?.page,
             glyphIndex: location?.glyph,
+            pageRect: pageRect,
           );
         })
         .toList(growable: false);
@@ -144,6 +152,7 @@ class ScoreParser {
       pages: pages,
       endTick: endTick,
       backend: 'Dart compatibility parser',
+      cursorSegments: cursorSegments,
     );
   }
 
@@ -208,8 +217,7 @@ class ScoreParser {
   }
 
   List<XmlElement> _scoreStaffElements(XmlElement root) {
-    final scores = root.findElements('Score').toList();
-    final scope = scores.isEmpty ? root : scores.first;
+    final scope = _scoreScope(root);
     var staves = scope
         .findElements('Staff')
         .where((staff) => staff.findElements('Measure').isNotEmpty)
@@ -221,6 +229,145 @@ class ScoreParser {
           .toList();
     }
     return staves;
+  }
+
+  XmlElement _scoreScope(XmlElement root) {
+    final scores = root.findElements('Score').toList();
+    return scores.isEmpty ? root : scores.first;
+  }
+
+  /// Reads the initial playback state for each score staff.
+  ///
+  /// MuseScore keeps the rendered staves separate from their instrument
+  /// definitions: a [Part] contains lightweight Staff entries and an
+  /// Instrument/Channel tree, while the score-level Staff contains measures.
+  /// Match by staff id first and retain part order as a fallback for older
+  /// files that omit ids.
+  List<_PlaybackProfile> _readPlaybackProfiles(
+    XmlElement root,
+    List<XmlElement> staffElements,
+  ) {
+    final byStaffId = <String, _PlaybackProfile>{};
+    final ordered = <_PlaybackProfile>[];
+    var nextChannel = 0;
+    final scope = _scoreScope(root);
+
+    for (final part in scope.findElements('Part')) {
+      XmlElement? instrument;
+      for (final child in part.children.whereType<XmlElement>()) {
+        if (child.localName == 'Instrument') {
+          instrument = child;
+          break;
+        }
+      }
+      final profile = _playbackProfile(instrument, nextChannel);
+      nextChannel = math.min(256, nextChannel + 1);
+
+      for (final partStaff in part.findElements('Staff')) {
+        ordered.add(profile);
+        final id = partStaff.getAttribute('id')?.trim();
+        if (id != null && id.isNotEmpty) {
+          byStaffId.putIfAbsent(id, () => profile);
+        }
+      }
+    }
+
+    return List<_PlaybackProfile>.generate(staffElements.length, (index) {
+      final id = staffElements[index].getAttribute('id')?.trim();
+      final byId = id == null || id.isEmpty ? null : byStaffId[id];
+      if (byId != null) return byId;
+      if (index < ordered.length) return ordered[index];
+      return _playbackProfile(null, index);
+    });
+  }
+
+  _PlaybackProfile _playbackProfile(XmlElement? instrument, int channel) {
+    final channels = <XmlElement>[];
+    if (instrument != null) {
+      for (final child in instrument.children.whereType<XmlElement>()) {
+        if (child.localName.toLowerCase() == 'channel') {
+          channels.add(child);
+        }
+      }
+    }
+
+    XmlElement? selected;
+    for (final candidate in channels) {
+      final name = candidate.getAttribute('name')?.trim().toLowerCase();
+      if (name == null ||
+          name.isEmpty ||
+          name == 'normal' ||
+          name == 'default') {
+        selected = candidate;
+        break;
+      }
+    }
+    selected ??= channels.isEmpty ? null : channels.first;
+
+    final program =
+        (_playbackValue(selected, 'program') ??
+                _playbackValue(instrument, 'program') ??
+                0)
+            .clamp(0, 127)
+            .toInt();
+    var bank = (_playbackBank(selected) ?? _playbackBank(instrument) ?? 0)
+        .clamp(0, 16383)
+        .toInt();
+    final drumset = _isTruthy(
+      instrument == null ? null : _directChildText(instrument, 'useDrumset'),
+    );
+    if (drumset && bank == 0) bank = 128;
+
+    return _PlaybackProfile(
+      channel: channel.clamp(0, 255).toInt(),
+      program: program,
+      bank: bank,
+    );
+  }
+
+  static int? _playbackValue(XmlElement? element, String name) {
+    if (element == null) return null;
+    final wanted = name.toLowerCase();
+    for (final child in element.children.whereType<XmlElement>()) {
+      if (child.localName.toLowerCase() != wanted) continue;
+      final raw = child.getAttribute('value') ?? child.innerText.trim();
+      final value = int.tryParse(raw);
+      if (value != null) return value;
+    }
+    return null;
+  }
+
+  static int? _playbackBank(XmlElement? element) {
+    if (element == null) return null;
+    int? msb;
+    int? lsb;
+    int? explicit;
+    for (final child in element.children.whereType<XmlElement>()) {
+      final name = child.localName.toLowerCase();
+      if (name == 'bank') {
+        final raw = child.getAttribute('value') ?? child.innerText.trim();
+        explicit = int.tryParse(raw);
+        continue;
+      }
+      if (name != 'controller') continue;
+      final controller = int.tryParse(child.getAttribute('ctrl') ?? '');
+      final value = int.tryParse(
+        child.getAttribute('value') ?? '',
+      )?.clamp(0, 127).toInt();
+      if (controller == 0) {
+        msb = value;
+      } else if (controller == 32) {
+        lsb = value;
+      }
+    }
+    if (explicit != null) return explicit;
+    if (msb == null && lsb == null) return null;
+    return ((msb ?? 0) << 7) | (lsb ?? 0);
+  }
+
+  static bool _isTruthy(String? value) {
+    final normalized = value?.trim().toLowerCase();
+    return normalized == '1' || normalized == 'true' || normalized == 'yes';
   }
 
   int _timeSignatureTicks(XmlElement measure, int division, int fallback) {
@@ -344,6 +491,7 @@ class ScoreParser {
 
   _ParsedMusic _readMusic(XmlElement root, int division) {
     final staffElements = _scoreStaffElements(root);
+    final playbackProfiles = _readPlaybackProfiles(root, staffElements);
 
     final events = <PlaybackEvent>[];
     final rests = <_RestMark>[];
@@ -352,6 +500,7 @@ class ScoreParser {
 
     for (var staffIndex = 0; staffIndex < staffElements.length; staffIndex++) {
       final staff = staffElements[staffIndex];
+      final playback = playbackProfiles[staffIndex];
       final measures = staff.findElements('Measure').toList();
       var staffCursor = 0;
       var nominalMeasureTicks = division * 4;
@@ -438,20 +587,56 @@ class ScoreParser {
                   _firstInt(note, 'velocity') ??
                   _firstInt(container, 'velocity') ??
                   80;
-              events.add(
-                PlaybackEvent(
-                  startTick: eventStart,
-                  endTick: eventEnd,
-                  pitch: pitch,
-                  velocity: velocity.clamp(1, 127),
-                  staff: staffIndex,
-                  voice: voice,
-                  measure: number,
-                  channel: 0,
-                  program: 0,
-                  bank: 0,
-                ),
-              );
+              final tuning = _firstDouble(note, 'tuning');
+
+              // MuseScore stores optional user NoteEvent entries below
+              // <Events>.  They are used by microtonal plugins (including
+              // Xen Tuner) when an offset is large enough to move the note
+              // to a neighbouring MIDI key.  Preserve those offsets in the
+              // compatibility parser just as libmscore's renderMidi path
+              // does; ordinary notes retain the single default event.
+              final playEvents = _readNotePlayEvents(note);
+              if (playEvents.isEmpty) {
+                events.add(
+                  PlaybackEvent(
+                    startTick: eventStart,
+                    endTick: eventEnd,
+                    pitch: pitch,
+                    tuning: tuning,
+                    velocity: velocity.clamp(1, 127),
+                    staff: staffIndex,
+                    voice: voice,
+                    measure: number,
+                    channel: playback.channel,
+                    program: playback.program,
+                    bank: playback.bank,
+                  ),
+                );
+                continue;
+              }
+
+              for (final playEvent in playEvents) {
+                final onOffset = (duration * playEvent.ontime / 1000.0).round();
+                final length = (duration * playEvent.len / 1000.0).round();
+                final startTick = eventStart + onOffset;
+                final endTick = math.max(startTick + 1, startTick + length);
+                final adjustedPitch = (pitch + playEvent.pitch).clamp(0, 127);
+                events.add(
+                  PlaybackEvent(
+                    startTick: startTick,
+                    endTick: endTick,
+                    pitch: adjustedPitch,
+                    tuning: tuning,
+                    velocity: velocity.clamp(1, 127),
+                    staff: staffIndex,
+                    voice: voice,
+                    measure: number,
+                    channel: playback.channel,
+                    program: playback.program,
+                    bank: playback.bank,
+                  ),
+                );
+              }
             }
           }
         }
@@ -704,6 +889,57 @@ class ScoreParser {
     return List.unmodifiable(pages);
   }
 
+  /// Generate cursor geometry for the deterministic compatibility layout.
+  ///
+  /// The native backend supplies this geometry directly from MuseScore's
+  /// [PositionCursor].  Keeping the same interval representation here makes
+  /// non-mobile tests and desktop diagnostics behave the same way.
+  List<ScoreCursorSegment> _buildCursorSegments({
+    required List<ScoreMeasure> measures,
+    required int staffCount,
+  }) {
+    const pageWidth = 820.0;
+    const pageHeight = 1160.0;
+    const margin = 64.0;
+    const measuresPerSystem = 4;
+    const systemsPerPage = 4;
+    const measuresPerPage = measuresPerSystem * systemsPerPage;
+    final visibleMeasures = measures.isEmpty
+        ? const [ScoreMeasure(number: 1, startTick: 0, endTick: 1920)]
+        : measures;
+    final result = <ScoreCursorSegment>[];
+    final measureWidth = (pageWidth - margin * 2) / measuresPerSystem;
+    for (var index = 0; index < visibleMeasures.length; index++) {
+      final measure = visibleMeasures[index];
+      final pageIndex = index ~/ measuresPerPage;
+      final localIndex = index % measuresPerPage;
+      final systemIndex = localIndex ~/ measuresPerSystem;
+      final slot = localIndex % measuresPerSystem;
+      final systemTop = 112.0 + systemIndex * 252.0;
+      final measureLeft = margin + slot * measureWidth;
+      final span = math.max(1, measure.endTick - measure.startTick);
+      // PositionCursor subtracts one spatium from the interpolated segment
+      // x.  The synthetic layout uses a 10px equivalent for that margin.
+      final startX = measureLeft - 10.0;
+      final endX = measureLeft + measureWidth - 10.0;
+      final top = math.max(0.0, systemTop - 30.0);
+      final height = math.min(
+        pageHeight - top,
+        54.0 + math.max(1, staffCount) * 78.0,
+      );
+      result.add(
+        ScoreCursorSegment(
+          startTick: measure.startTick,
+          endTick: measure.startTick + span,
+          pageIndex: pageIndex,
+          rect: ScoreRect(startX, top, 30.0, math.max(1.0, height)),
+          endX: endX,
+        ),
+      );
+    }
+    return List.unmodifiable(result);
+  }
+
   bool _durationLooksOpen(PlaybackEvent event, ScoreMeasure measure) {
     final duration = event.endTick - event.startTick;
     final span = math.max(1, measure.endTick - measure.startTick);
@@ -757,6 +993,28 @@ class ScoreParser {
   static int? _firstInt(XmlNode node, String name) =>
       int.tryParse(_firstText(node, name) ?? '');
 
+  static double _firstDouble(XmlNode node, String name) {
+    final value = double.tryParse(_firstText(node, name) ?? '');
+    // Note::tuning is a qreal in MuseScore and is expressed in cents.  Do not
+    // allow malformed/non-finite XML values to poison the audio timeline.
+    return value != null && value.isFinite ? value : 0.0;
+  }
+
+  static List<_NotePlaybackEvent> _readNotePlayEvents(XmlElement note) {
+    final events = <_NotePlaybackEvent>[];
+    for (final event in note.findAllElements('Event')) {
+      // Only Event elements nested in the note's Events container describe
+      // note playback.  A defensive parent check avoids accidentally
+      // consuming unrelated elements in malformed documents.
+      if (event.parentElement?.localName != 'Events') continue;
+      final pitch = _directChildInt(event, 'pitch') ?? 0;
+      final ontime = _directChildInt(event, 'ontime') ?? 0;
+      final len = _directChildInt(event, 'len') ?? 1000;
+      events.add(_NotePlaybackEvent(pitch: pitch, ontime: ontime, len: len));
+    }
+    return events;
+  }
+
   static String? _directChildText(XmlElement element, String name) {
     for (final child in element.findElements(name)) {
       final text = child.innerText.trim();
@@ -792,6 +1050,18 @@ class _Metadata {
   final String composer;
 }
 
+class _PlaybackProfile {
+  const _PlaybackProfile({
+    required this.channel,
+    required this.program,
+    required this.bank,
+  });
+
+  final int channel;
+  final int program;
+  final int bank;
+}
+
 class _MeasureAccumulator {
   _MeasureAccumulator(this.start, this.end);
 
@@ -811,6 +1081,18 @@ class _RestMark {
   final int endTick;
   final int staff;
   final int measure;
+}
+
+class _NotePlaybackEvent {
+  const _NotePlaybackEvent({
+    required this.pitch,
+    required this.ontime,
+    required this.len,
+  });
+
+  final int pitch;
+  final int ontime;
+  final int len;
 }
 
 class _ParsedMusic {

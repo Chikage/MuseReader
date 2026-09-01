@@ -8,6 +8,12 @@ The original source and its license files are kept in the supplied checkout:
 
 `/Volumes/Files/Github/MuseScore-3.6.2/`
 
+The application launcher/AppIcon artwork in `assets/branding/muse_reader_icon.svg`
+is the MuseScore 3.6.2 round application mark copied from
+`assets/musescore-icon-round.svg`; the generated Android and iOS PNGs are
+derived from that source. MuseScore and its logo are trademarks of their
+respective owners; this migration does not imply endorsement or affiliation.
+
 The product packages also link Qt 5.15.2 Core, Gui, Widgets, Xml and Svg, and
 compile Qt's minimal platform plugin. Qt's open-source distribution includes
 GPL/LGPL license choices and component-specific notices. MuseScore's qzip and

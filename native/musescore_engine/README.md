@@ -14,9 +14,11 @@ The adapter uses the same source of truth for engraving and playback:
 5. `Score::utick2utime()` converts expanded ticks through MuseScore's
    `TempoMap` and `RepeatList`.
 
-The JSON response contains rendered pages, integer-microsecond event times, and
-`Note::pageBoundingRect()` coordinates from the same laid-out `MasterScore`.
-Flutter therefore does not reconstruct engraving geometry or playback timing.
+The JSON response contains rendered pages, integer-microsecond event times,
+per-note `Note::tuning` cent offsets, and `Note::pageBoundingRect()` coordinates
+from the same laid-out `MasterScore`. Flutter therefore does not reconstruct
+engraving geometry or playback timing. A tuning value is carried alongside the
+integer MIDI pitch; this preserves independently tuned unisons.
 
 ## Bundled playback
 
@@ -27,8 +29,9 @@ product build. The CMake resource file embeds the MuseScore 3.6.2 default
 copied into the Flutter asset bundle a second time. SF3 Ogg
 packets are decoded in memory by the bundled `stb_vorbis` implementation.
 
-`muse_reader_audio.cpp` converts the native note-event JSON into FluidSynth
-program/note events and exposes a small pull-render API in
+`muse_reader_audio.cpp` converts the native note-event JSON (including each
+note's cent offset) into FluidSynth program/note events and exposes a small
+pull-render API in
 `muse_reader_engine.h`. Android feeds that API to a stereo `AudioTrack`, while
 iOS feeds it to an `AVAudioSourceNode`. Both platforms retain the existing
 simple oscillator as a fallback for development builds whose native library

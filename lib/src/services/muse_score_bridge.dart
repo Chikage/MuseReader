@@ -12,6 +12,9 @@ class MuseScoreBridge {
   MuseScoreBridge._();
 
   static const _channel = MethodChannel('com.musereader/musescore_engine');
+  // MuseScore uses an unsigned-byte playback channel.  It may allocate more
+  // than the sixteen wire-MIDI channels for articulation/instrument states.
+  static const _maxPlaybackChannel = 255;
 
   static Future<ScoreDocument?> open(String path, {String? sourcePath}) async {
     try {
@@ -118,6 +121,7 @@ class MuseScoreBridge {
               startUs: _asIntOrNull(raw['startUs']),
               endUs: _asIntOrNull(raw['endUs']),
               pitch: _asInt(raw['pitch'], fallback: 60),
+              tuning: _asTuning(raw),
               velocity: _asInt(
                 raw['velocity'],
                 fallback: 80,
@@ -125,11 +129,15 @@ class MuseScoreBridge {
               staff: _asInt(raw['staff']),
               voice: _asInt(raw['voice']),
               measure: _asInt(raw['measure'], fallback: 1),
-              channel: _asInt(raw['channel']).clamp(0, 15).toInt(),
+              channel: _asInt(
+                raw['channel'],
+              ).clamp(0, _maxPlaybackChannel).toInt(),
               program: _asInt(raw['program']).clamp(0, 127).toInt(),
               bank: _asInt(raw['bank']).clamp(0, 16383).toInt(),
               pageIndex: _asIntOrNull(raw['page']),
               pageRect: _scoreRectOrNull(raw['rect']),
+              cursorRect: _scoreRectOrNull(raw['cursor']),
+              cursorEndX: _asDoubleOrNull(raw['cursorEndX']),
             ),
           );
         }
@@ -176,6 +184,26 @@ class MuseScoreBridge {
     if (pages.isEmpty) {
       throw const MuseScoreBridgeException('MuseScore 原生核心没有返回任何已渲染页面。');
     }
+    final cursorSegments = <ScoreCursorSegment>[];
+    final rawCursorSegments = map['cursorSegments'];
+    if (rawCursorSegments is Iterable) {
+      for (final raw in rawCursorSegments) {
+        if (raw is! Map) continue;
+        final segment = _cursorSegmentFromMap(raw);
+        if (segment != null &&
+            segment.pageIndex >= 0 &&
+            segment.pageIndex < pages.length) {
+          cursorSegments.add(segment);
+        }
+      }
+    }
+    cursorSegments.sort((a, b) {
+      final tickOrder = a.startTick.compareTo(b.startTick);
+      if (tickOrder != 0) return tickOrder;
+      final pageOrder = a.pageIndex.compareTo(b.pageIndex);
+      if (pageOrder != 0) return pageOrder;
+      return a.endTick.compareTo(b.endTick);
+    });
     final endTick = _asInt(
       map['endTick'],
       fallback: events.fold<int>(
@@ -205,6 +233,7 @@ class MuseScoreBridge {
       durationUsOverride: durationUs,
       symbolFont: symbolFont.isEmpty ? null : symbolFont,
       renderDpi: _asPositiveIntOrNull(map['renderDpi']),
+      cursorSegments: List.unmodifiable(cursorSegments),
     );
   }
 
@@ -226,26 +255,54 @@ class MuseScoreBridge {
 
   static ScoreRect? _scoreRectOrNull(dynamic value) {
     if (value is! Map) return null;
-    final width = _asDouble(value['width']);
-    final height = _asDouble(value['height']);
-    if (width <= 0 || height <= 0) return null;
-    return ScoreRect(
-      _asDouble(value['x']),
-      _asDouble(value['y']),
-      width,
-      height,
+    final left = _asDoubleOrNull(value['x']);
+    final top = _asDoubleOrNull(value['y']);
+    final width = _asDoubleOrNull(value['width']);
+    final height = _asDoubleOrNull(value['height']);
+    if (left == null ||
+        top == null ||
+        width == null ||
+        height == null ||
+        width <= 0 ||
+        height <= 0) {
+      return null;
+    }
+    return ScoreRect(left, top, width, height);
+  }
+
+  static ScoreCursorSegment? _cursorSegmentFromMap(Map<dynamic, dynamic> raw) {
+    final rect =
+        _scoreRectOrNull(raw['rect']) ?? _scoreRectOrNull(raw['cursor']);
+    if (rect == null) return null;
+    final startTick = _asInt(raw['startTick']);
+    final endTick = _asInt(raw['endTick'], fallback: startTick);
+    final pageIndex = _asInt(raw['page'], fallback: _asInt(raw['pageIndex']));
+    final endX = _asDoubleOrNull(raw['endX'] ?? raw['cursorEndX']);
+    final startUs = _asIntOrNull(raw['startUs']);
+    final endUs = _asIntOrNull(raw['endUs']);
+    final hasValidTimeRange =
+        startUs != null && endUs != null && endUs > startUs;
+    if (endTick <= startTick || (endX != null && !endX.isFinite)) return null;
+    return ScoreCursorSegment(
+      startTick: startTick,
+      endTick: endTick,
+      pageIndex: pageIndex,
+      rect: rect,
+      endX: endX,
+      startUs: hasValidTimeRange ? startUs : null,
+      endUs: hasValidTimeRange ? endUs : null,
     );
   }
 
   static int _asInt(dynamic value, {int fallback = 0}) {
-    if (value is int) return value;
-    if (value is num) return value.round();
-    return int.tryParse('$value') ?? fallback;
+    return _asIntOrNull(value) ?? fallback;
   }
 
   static int? _asIntOrNull(dynamic value) {
     if (value == null) return null;
-    return _asInt(value);
+    if (value is int) return value;
+    if (value is num) return value.isFinite ? value.round() : null;
+    return int.tryParse('$value');
   }
 
   static int? _asPositiveIntOrNull(dynamic value) {
@@ -254,8 +311,23 @@ class MuseScoreBridge {
   }
 
   static double _asDouble(dynamic value, {double fallback = 0}) {
-    if (value is num) return value.toDouble();
-    return double.tryParse('$value') ?? fallback;
+    return _asDoubleOrNull(value) ?? fallback;
+  }
+
+  static double? _asDoubleOrNull(dynamic value) {
+    if (value == null) return null;
+    final parsed = value is num ? value.toDouble() : double.tryParse('$value');
+    return parsed != null && parsed.isFinite ? parsed : null;
+  }
+
+  static double _asTuning(Map<dynamic, dynamic> raw) {
+    // `tuning` is MuseScore's public Note property (in cents).  Accept the
+    // `cents` spelling as a compatibility alias for exported/plugin event
+    // streams, but always expose one normalized value to the audio backends.
+    final value = raw.containsKey('tuning') ? raw['tuning'] : raw['cents'];
+    final parsed = _asDoubleOrNull(value);
+    if (parsed == null || !parsed.isFinite) return 0.0;
+    return parsed.clamp(-1000000.0, 1000000.0).toDouble();
   }
 
   static String _asString(dynamic value, {String fallback = ''}) {

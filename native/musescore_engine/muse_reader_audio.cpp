@@ -27,6 +27,10 @@
 namespace {
 
 constexpr int kAudioSampleRate = 44100;
+// MuseScore's playback channel is an unsigned byte.  A score may allocate
+// more than the sixteen wire-MIDI channels when articulation channels and
+// instrument changes are present.
+constexpr int kMaxPlaybackChannel = 255;
 
 #if defined(MUSE_READER_WITH_FLUIDSYNTH)
 
@@ -34,9 +38,18 @@ struct AudioAction {
   enum class Kind : unsigned char { program = 0, note_off = 1, note_on = 2 };
 
   double time_us = 0.0;
+  // Preserve the source event order for actions sharing a timestamp.  A
+  // program change must stay adjacent to the note it configures; sorting all
+  // program actions ahead of all note-ons would make simultaneous notes with
+  // different instruments use whichever program happened to be last.
+  std::uint64_t order = 0;
   Kind kind = Kind::note_on;
   int channel = 0;
   int pitch = 60;
+  // Per-note cent offset carried by MuseScore's PlayEvent.  FluidSynth's
+  // voice API expects this as a midicent adjustment rather than a channel
+  // pitch bend, so simultaneous notes can have independent tunings.
+  double tuning = 0.0;
   int velocity = 80;
   int program = 0;
   int bank = 0;
@@ -68,6 +81,23 @@ qint64 json_integer(const QJsonObject& object, const char* key, qint64 fallback)
 int json_int(const QJsonObject& object, const char* key, int fallback) {
   const qint64 value = json_integer(object, key, fallback);
   return static_cast<int>(qBound<qint64>(INT_MIN, value, INT_MAX));
+}
+
+double json_double(const QJsonObject& object, const char* key,
+                   double fallback) {
+  const QJsonValue value = object.value(QLatin1String(key));
+  double result = fallback;
+  if (value.isDouble()) {
+    result = value.toDouble();
+  } else if (value.isString()) {
+    bool ok = false;
+    const double parsed = value.toString().toDouble(&ok);
+    if (ok) result = parsed;
+  }
+  if (!std::isfinite(result)) return fallback;
+  // Keep the same safety envelope as MuseScore's
+  // normalizedPlayEventTuning() helper.
+  return std::clamp(result, -1000000.0, 1000000.0);
 }
 
 bool ensure_fluid_locked() {
@@ -123,12 +153,14 @@ void dispatch_action(const AudioAction& action) {
       event = Ms::NPlayEvent(Ms::ME_NOTEOFF,
                              static_cast<uchar>(action.channel),
                              static_cast<uchar>(action.pitch), 0);
+      event.setTuning(static_cast<float>(action.tuning));
       break;
     case AudioAction::Kind::note_on:
       event = Ms::NPlayEvent(Ms::ME_NOTEON,
                              static_cast<uchar>(action.channel),
                              static_cast<uchar>(action.pitch),
                              static_cast<uchar>(action.velocity));
+      event.setTuning(static_cast<float>(action.tuning));
       break;
   }
   g_fluid->play(event);
@@ -155,6 +187,7 @@ bool parse_actions(const char* events_json, int64_t position_us) {
   }
 
   const double position = g_audio_cursor_us;
+  std::uint64_t next_order = 0;
   for (const QJsonValue& value : document.array()) {
     if (!value.isObject()) continue;
     const QJsonObject object = value.toObject();
@@ -168,24 +201,28 @@ bool parse_actions(const char* events_json, int64_t position_us) {
                                    static_cast<double>(end_value));
     if (end_us <= position) continue;
 
-    const int channel = qBound(0, json_int(object, "channel", 0), 15);
+    const int channel =
+        qBound(0, json_int(object, "channel", 0), kMaxPlaybackChannel);
     const int pitch = qBound(0, json_int(object, "pitch", 60), 127);
     const int velocity = qBound(1, json_int(object, "velocity", 80), 127);
     const int program = qBound(0, json_int(object, "program", 0), 127);
     const int bank = qBound(0, json_int(object, "bank", 0), 16383);
+    const double tuning = object.contains(QLatin1String("tuning"))
+                              ? json_double(object, "tuning", 0.0)
+                              : json_double(object, "cents", 0.0);
     const double note_on_us = std::max(start_us, position);
 
     // Program changes are attached to notes by the MuseScore bridge. Sending
     // one immediately before each note preserves instrument changes without
     // requiring a second platform channel or a separate event stream.
     g_actions.push_back(
-        {note_on_us, AudioAction::Kind::program, channel, pitch, velocity,
-         program, bank});
+        {note_on_us, next_order++, AudioAction::Kind::program, channel, pitch,
+         tuning, 0, program, bank});
     g_actions.push_back(
-        {note_on_us, AudioAction::Kind::note_on, channel, pitch, velocity,
-         program, bank});
-    g_actions.push_back(
-        {end_us, AudioAction::Kind::note_off, channel, pitch, 0, program, bank});
+        {note_on_us, next_order++, AudioAction::Kind::note_on, channel, pitch,
+         tuning, velocity, program, bank});
+    g_actions.push_back({end_us, next_order++, AudioAction::Kind::note_off,
+                         channel, pitch, tuning, 0, program, bank});
     g_audio_tail_end_us = std::max(g_audio_tail_end_us, end_us);
   }
 
@@ -198,8 +235,7 @@ bool parse_actions(const char* events_json, int64_t position_us) {
                    [](const AudioAction& left, const AudioAction& right) {
                      if (left.time_us != right.time_us)
                        return left.time_us < right.time_us;
-                     return static_cast<unsigned>(left.kind) <
-                            static_cast<unsigned>(right.kind);
+                     return left.order < right.order;
                    });
   // Allow the SoundFont release envelope to ring out without holding the
   // platform audio stream open indefinitely.

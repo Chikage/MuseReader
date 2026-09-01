@@ -12,6 +12,99 @@ class ScoreRect {
   final double top;
   final double width;
   final double height;
+
+  double get right => left + width;
+
+  double get bottom => top + height;
+
+  bool get isFinite =>
+      left.isFinite && top.isFinite && width.isFinite && height.isFinite;
+}
+
+/// One interval of the playback cursor on an engraved page.
+///
+/// MuseScore positions its playback cursor by interpolating between the
+/// visible chord/rest segments in a measure.  Keeping the interval in the
+/// same page coordinate space as the rendered PNG lets Flutter draw the
+/// cursor without attempting to lay the score out a second time.
+class ScoreCursorSegment {
+  const ScoreCursorSegment({
+    required this.startTick,
+    required this.endTick,
+    required this.pageIndex,
+    required this.rect,
+    this.endX,
+    this.startUs,
+    this.endUs,
+  });
+
+  final int startTick;
+  final int endTick;
+  final int pageIndex;
+
+  /// Cursor rectangle at [startTick].  Only the x coordinate changes while
+  /// the cursor travels through this interval.
+  final ScoreRect rect;
+
+  /// x coordinate at [endTick].  Older/native payloads may omit it; in that
+  /// case the cursor remains at [rect.left].
+  final double? endX;
+
+  /// Optional playback-time bounds. Native scores provide these from
+  /// `RepeatList::utick2utime()` so repeated passages remain unambiguous even
+  /// when their unrolled tick range overlaps the original score.
+  final int? startUs;
+  final int? endUs;
+
+  bool get hasTimeRange =>
+      startUs != null && endUs != null && endUs! > startUs!;
+
+  bool get isUsable =>
+      endTick > startTick &&
+      pageIndex >= 0 &&
+      rect.isFinite &&
+      rect.width > 0 &&
+      rect.height > 0 &&
+      (endX == null || endX!.isFinite);
+
+  double xAtTick(int tick) {
+    final destination = endX ?? rect.left;
+    if (endTick <= startTick) return rect.left;
+    final amount = ((tick - startTick) / (endTick - startTick))
+        .clamp(0.0, 1.0)
+        .toDouble();
+    return rect.left + (destination - rect.left) * amount;
+  }
+
+  ScoreRect rectAtTick(int tick) =>
+      ScoreRect(xAtTick(tick), rect.top, rect.width, rect.height);
+
+  ScoreRect rectAtTime(int microseconds) {
+    if (!hasTimeRange) return rect;
+    final amount = ((microseconds - startUs!) / (endUs! - startUs!))
+        .clamp(0.0, 1.0)
+        .toDouble();
+    final destination = endX ?? rect.left;
+    return ScoreRect(
+      rect.left + (destination - rect.left) * amount,
+      rect.top,
+      rect.width,
+      rect.height,
+    );
+  }
+}
+
+/// A cursor rectangle resolved for a particular playback position.
+class ScoreCursorPosition {
+  const ScoreCursorPosition({
+    required this.pageIndex,
+    required this.rect,
+    required this.tick,
+  });
+
+  final int pageIndex;
+  final ScoreRect rect;
+  final int tick;
 }
 
 class ScoreGlyph {
@@ -162,6 +255,7 @@ class PlaybackEvent {
     required this.startTick,
     required this.endTick,
     required this.pitch,
+    this.tuning = 0.0,
     required this.velocity,
     required this.staff,
     required this.voice,
@@ -174,11 +268,23 @@ class PlaybackEvent {
     this.pageIndex,
     this.glyphIndex,
     this.pageRect,
+    this.cursorRect,
+    this.cursorEndX,
   });
 
   final int startTick;
   final int endTick;
   final int pitch;
+
+  /// Per-note pitch offset in cents, as stored by MuseScore's
+  /// `Note::tuning` property.  A value of `100` raises the note by one
+  /// semitone while leaving the integer MIDI key in [pitch] unchanged.
+  ///
+  /// MuseScore's bundled FluidSynth consumes this value as a per-voice
+  /// midicent offset, which is what lets two notes sharing one MIDI key use
+  /// different microtonal tunings at the same time.
+  final double tuning;
+
   final int velocity;
   final int staff;
   final int voice;
@@ -192,15 +298,30 @@ class PlaybackEvent {
   final int? glyphIndex;
   final ScoreRect? pageRect;
 
+  /// Optional native cursor geometry for scores with repeats.  The event
+  /// stream is unrolled by MuseScore, while its note still points at the
+  /// original engraved page; this anchor keeps the cursor on that page when
+  /// the unrolled tick is outside the original score range.
+  final ScoreRect? cursorRect;
+  final double? cursorEndX;
+
   int resolvedStartUs(TempoMap tempoMap) =>
       startUs ?? tempoMap.tickToUs(startTick);
 
   int resolvedEndUs(TempoMap tempoMap) => endUs ?? tempoMap.tickToUs(endTick);
 
-  PlaybackEvent copyWith({int? pageIndex, int? glyphIndex}) => PlaybackEvent(
+  PlaybackEvent copyWith({
+    int? pageIndex,
+    int? glyphIndex,
+    ScoreRect? pageRect,
+    ScoreRect? cursorRect,
+    double? cursorEndX,
+    double? tuning,
+  }) => PlaybackEvent(
     startTick: startTick,
     endTick: endTick,
     pitch: pitch,
+    tuning: tuning ?? this.tuning,
     velocity: velocity,
     staff: staff,
     voice: voice,
@@ -212,7 +333,9 @@ class PlaybackEvent {
     endUs: endUs,
     pageIndex: pageIndex ?? this.pageIndex,
     glyphIndex: glyphIndex ?? this.glyphIndex,
-    pageRect: pageRect,
+    pageRect: pageRect ?? this.pageRect,
+    cursorRect: cursorRect ?? this.cursorRect,
+    cursorEndX: cursorEndX ?? this.cursorEndX,
   );
 
   Map<String, Object> toMap(TempoMap tempoMap) => {
@@ -221,6 +344,10 @@ class PlaybackEvent {
     'startUs': resolvedStartUs(tempoMap),
     'endUs': resolvedEndUs(tempoMap),
     'pitch': pitch,
+    // Keep the field in every event, including ordinary 12-TET notes.  An
+    // explicit zero lets the native renderer distinguish a tuned voice from
+    // a legacy event when matching note-offs.
+    'tuning': tuning.isFinite ? tuning : 0.0,
     'velocity': velocity,
     'staff': staff,
     'voice': voice,
@@ -249,6 +376,7 @@ class ScoreDocument {
     this.durationUsOverride,
     this.symbolFont,
     this.renderDpi,
+    this.cursorSegments = const [],
   });
 
   final String sourcePath;
@@ -266,6 +394,7 @@ class ScoreDocument {
   final int? durationUsOverride;
   final String? symbolFont;
   final int? renderDpi;
+  final List<ScoreCursorSegment> cursorSegments;
 
   int get durationUs =>
       durationUsOverride ??
@@ -275,6 +404,192 @@ class ScoreDocument {
       );
 
   Duration get duration => Duration(microseconds: durationUs);
+
+  /// Resolve the engraved cursor rectangle for a score tick.
+  ScoreCursorPosition? cursorForTick(int tick) {
+    final usableSegments = _usableCursorSegments();
+    if (usableSegments.isEmpty) return null;
+    ScoreCursorSegment? previous;
+    for (final segment in usableSegments) {
+      if (tick < segment.startTick) {
+        final chosen = previous ?? segment;
+        return ScoreCursorPosition(
+          pageIndex: chosen.pageIndex,
+          rect: chosen.rectAtTick(
+            previous == null ? chosen.startTick : chosen.endTick,
+          ),
+          tick: tick,
+        );
+      }
+      if (tick < segment.endTick) {
+        return ScoreCursorPosition(
+          pageIndex: segment.pageIndex,
+          rect: segment.rectAtTick(tick),
+          tick: tick,
+        );
+      }
+      previous = segment;
+    }
+    final last = usableSegments.last;
+    return ScoreCursorPosition(
+      pageIndex: last.pageIndex,
+      rect: last.rectAtTick(last.endTick),
+      tick: tick,
+    );
+  }
+
+  /// Resolve a cursor from playback time, including a note anchor when the
+  /// time belongs to an unrolled repeat that has no original-score segment.
+  ScoreCursorPosition? cursorForTime(int microseconds) {
+    final tick = tempoMap.usToTick(microseconds);
+    final usableSegments = _usableCursorSegments();
+    if (usableSegments.isNotEmpty &&
+        usableSegments.every((segment) => segment.hasTimeRange)) {
+      final timedSegments = [...usableSegments]
+        ..sort((a, b) {
+          final startOrder = a.startUs!.compareTo(b.startUs!);
+          if (startOrder != 0) return startOrder;
+          final endOrder = a.endUs!.compareTo(b.endUs!);
+          if (endOrder != 0) return endOrder;
+          return a.pageIndex.compareTo(b.pageIndex);
+        });
+      ScoreCursorSegment? previous;
+      for (final segment in timedSegments) {
+        final start = segment.startUs!;
+        final end = segment.endUs!;
+        if (microseconds < start) {
+          final chosen = previous ?? segment;
+          return ScoreCursorPosition(
+            pageIndex: chosen.pageIndex,
+            rect: chosen.rectAtTime(
+              previous == null ? chosen.startUs! : chosen.endUs!,
+            ),
+            tick: tick,
+          );
+        }
+        if (microseconds < end) {
+          return ScoreCursorPosition(
+            pageIndex: segment.pageIndex,
+            rect: segment.rectAtTime(microseconds),
+            tick: tick,
+          );
+        }
+        previous = segment;
+      }
+      final last = timedSegments.last;
+      return ScoreCursorPosition(
+        pageIndex: last.pageIndex,
+        rect: last.rectAtTime(last.endUs!),
+        tick: tick,
+      );
+    }
+
+    // For the ordinary (non-repeat) timeline the native segment geometry is
+    // the exact source-of-truth cursor path. Use it before note anchors so a
+    // long note does not make the cursor move at the note duration rather than
+    // at the engraved segment boundary.
+    final maxSegmentTick = usableSegments.fold<int>(
+      0,
+      (value, segment) => math.max(value, segment.endTick),
+    );
+    if (usableSegments.isNotEmpty && tick <= maxSegmentTick) {
+      final fromSegments = cursorForTick(tick);
+      if (fromSegments != null) return fromSegments;
+    }
+
+    for (final event in events) {
+      final start = event.resolvedStartUs(tempoMap);
+      final end = event.resolvedEndUs(tempoMap);
+      if (microseconds >= start && microseconds < end) {
+        final anchor = event.cursorRect;
+        if (anchor != null &&
+            anchor.isFinite &&
+            anchor.width > 0 &&
+            anchor.height > 0) {
+          final destination = event.cursorEndX;
+          final safeDestination = destination != null && destination.isFinite
+              ? destination
+              : anchor.left;
+          final amount =
+              destination == null || !destination.isFinite || end <= start
+              ? 0.0
+              : ((microseconds - start) / (end - start))
+                    .clamp(0.0, 1.0)
+                    .toDouble();
+          final eventTick = tempoMap.usToTick(microseconds);
+          return ScoreCursorPosition(
+            pageIndex: event.pageIndex ?? 0,
+            rect: ScoreRect(
+              anchor.left + (safeDestination - anchor.left) * amount,
+              anchor.top,
+              anchor.width,
+              anchor.height,
+            ),
+            tick: eventTick,
+          );
+        }
+      }
+    }
+    // A repeat can leave a short interval with no sounding note. Keep the
+    // cursor on the last engraved event instead of jumping to the final
+    // original-score segment while the unrolled tick is outside that range.
+    PlaybackEvent? previous;
+    for (final event in events) {
+      if (event.cursorRect == null ||
+          microseconds < event.resolvedStartUs(tempoMap)) {
+        continue;
+      }
+      previous = event;
+    }
+    final previousRect = previous?.cursorRect;
+    if (previous != null && previousRect != null && previousRect.isFinite) {
+      return ScoreCursorPosition(
+        pageIndex: previous.pageIndex ?? 0,
+        rect: previousRect,
+        tick: tick,
+      );
+    }
+
+    // Compatibility documents created before cursor metadata used note
+    // bounding boxes only.  Build a conservative system-height cursor so the
+    // migrated indicator still appears for those documents.
+    for (final event in events) {
+      final start = event.resolvedStartUs(tempoMap);
+      final end = event.resolvedEndUs(tempoMap);
+      if (microseconds < start || microseconds >= end) continue;
+      final note = event.pageRect;
+      if (note == null || !note.isFinite) continue;
+      final page = event.pageIndex ?? 0;
+      final sameSystem = events
+          .where(
+            (other) =>
+                (other.pageIndex ?? 0) == page &&
+                other.measure == event.measure &&
+                other.pageRect != null,
+          )
+          .map((other) => other.pageRect!)
+          .toList(growable: false);
+      var top = note.top;
+      var bottom = note.bottom;
+      for (final rect in sameSystem) {
+        top = math.min(top, rect.top);
+        bottom = math.max(bottom, rect.bottom);
+      }
+      const margin = 30.0;
+      final height = math.max(1.0, bottom - top + margin * 2);
+      final width = math.max(24.0, note.width + 18.0);
+      return ScoreCursorPosition(
+        pageIndex: page,
+        rect: ScoreRect(note.left - 9.0, top - margin, width, height),
+        tick: event.startTick,
+      );
+    }
+    return null;
+  }
+
+  List<ScoreCursorSegment> _usableCursorSegments() => cursorSegments
+      .where((segment) => segment.isUsable)
+      .toList(growable: false);
 
   int pageForTick(int tick) {
     if (pages.isEmpty) return 0;

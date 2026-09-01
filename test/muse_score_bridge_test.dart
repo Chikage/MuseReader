@@ -35,6 +35,64 @@ void main() {
             'measures': [
               {'number': 1, 'startTick': 0, 'endTick': 480},
             ],
+            'cursorSegments': [
+              {
+                'startTick': 480,
+                'endTick': 960,
+                'page': 0,
+                'rect': {
+                  'x': 200.0,
+                  'y': 180.0,
+                  'width': 30.0,
+                  'height': 180.0,
+                },
+                'endX': 300.0,
+                'startUs': 500000,
+                'endUs': 1000000,
+              },
+              {
+                'startTick': 0,
+                'endTick': 480,
+                'page': 0,
+                'rect': {'x': 80.0, 'y': 180.0, 'width': 30.0, 'height': 180.0},
+                'endX': 180.0,
+                'startUs': 0,
+                'endUs': 500000,
+              },
+              {
+                'startTick': 960,
+                'endTick': 960,
+                'page': 0,
+                'rect': {
+                  'x': 320.0,
+                  'y': 180.0,
+                  'width': 30.0,
+                  'height': 180.0,
+                },
+              },
+              {
+                'startTick': 960,
+                'endTick': 1440,
+                'page': 4,
+                'rect': {
+                  'x': 320.0,
+                  'y': 180.0,
+                  'width': 30.0,
+                  'height': 180.0,
+                },
+              },
+              {
+                'startTick': 960,
+                'endTick': 1440,
+                'page': 0,
+                'rect': {
+                  'x': 'NaN',
+                  'y': 180.0,
+                  'width': 30.0,
+                  'height': 180.0,
+                },
+              },
+            ],
             'events': [
               {
                 'startTick': 0,
@@ -42,8 +100,9 @@ void main() {
                 'startUs': 0,
                 'endUs': 500000,
                 'pitch': 60,
+                'tuning': 33.3333,
                 'velocity': 90,
-                'channel': 9,
+                'channel': 31,
                 'program': 56,
                 'bank': 128,
                 'staff': 0,
@@ -51,6 +110,13 @@ void main() {
                 'measure': 1,
                 'page': 0,
                 'rect': {'x': 100.0, 'y': 200.0, 'width': 20.0, 'height': 16.0},
+                'cursor': {
+                  'x': 80.0,
+                  'y': 180.0,
+                  'width': 30.0,
+                  'height': 180.0,
+                },
+                'cursorEndX': 180.0,
               },
             ],
             'pages': [
@@ -83,14 +149,32 @@ void main() {
       expect(document.pages.single.pixelHeight, 2105);
       expect(document.pages.single.imageBytes, isNotEmpty);
       expect(document.events.single.voice, 2);
+      expect(document.events.single.tuning, closeTo(33.3333, 0.000001));
       expect(document.events.single.measure, 1);
-      expect(document.events.single.channel, 9);
+      expect(document.events.single.cursorRect!.left, 80);
+      expect(document.events.single.cursorEndX, 180);
+      expect(document.cursorSegments, hasLength(2));
+      expect(document.cursorSegments.first.startTick, 0);
+      expect(document.cursorSegments.last.startTick, 480);
+      expect(document.cursorSegments.first.startUs, 0);
+      expect(document.cursorSegments.first.endUs, 500000);
+      expect(document.cursorSegments.last.startUs, 500000);
+      expect(document.cursorSegments.last.endUs, 1000000);
+      final cursor = document.cursorForTime(250000);
+      expect(cursor, isNotNull);
+      expect(cursor!.pageIndex, 0);
+      expect(cursor.rect.left, closeTo(130, 0.0001));
+      expect(document.events.single.channel, 31);
       expect(document.events.single.program, 56);
       expect(document.events.single.bank, 128);
       expect(document.events.single.pageRect!.left, 100);
-      expect(document.nativeEvents.single['channel'], 9);
+      expect(document.nativeEvents.single['channel'], 31);
       expect(document.nativeEvents.single['program'], 56);
       expect(document.nativeEvents.single['bank'], 128);
+      expect(
+        document.nativeEvents.single['tuning'],
+        closeTo(33.3333, 0.000001),
+      );
     },
   );
 

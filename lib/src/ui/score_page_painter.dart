@@ -2,18 +2,23 @@ import 'package:flutter/material.dart';
 
 import '../model/score_document.dart';
 
+/// MuseScore 3.6.2's first voice/playback selection colour.
+const museScorePlaybackColor = Color(0xff0065bf);
+
 class ScorePagePainter extends CustomPainter {
   const ScorePagePainter({
     required this.page,
     required this.activeEventIndexes,
     required this.inkColor,
     required this.accentColor,
+    this.playbackCursor,
   });
 
   final ScorePage page;
   final Set<int> activeEventIndexes;
   final Color inkColor;
   final Color accentColor;
+  final ScoreRect? playbackCursor;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -91,7 +96,32 @@ class ScorePagePainter extends CustomPainter {
           );
       }
     }
+    _drawPlaybackCursor(canvas);
     canvas.restore();
+  }
+
+  void _drawPlaybackCursor(Canvas canvas) {
+    final cursor = playbackCursor;
+    if (cursor == null ||
+        !cursor.isFinite ||
+        cursor.width <= 0 ||
+        cursor.height <= 0) {
+      return;
+    }
+    final pageRect = Rect.fromLTWH(0, 0, page.width, page.height);
+    final rect = Rect.fromLTWH(
+      cursor.left,
+      cursor.top,
+      cursor.width,
+      cursor.height,
+    ).intersect(pageRect);
+    if (rect.isEmpty) return;
+    // PositionCursor::paint() in MuseScore fills the complete system cursor
+    // with the selection colour at alpha 50 and does not draw an outline.
+    final paint = Paint()
+      ..color = accentColor.withValues(alpha: 50 / 255.0)
+      ..style = PaintingStyle.fill;
+    canvas.drawRect(rect, paint);
   }
 
   void _drawText(
@@ -138,8 +168,10 @@ class ScorePagePainter extends CustomPainter {
     );
     canvas.restore();
 
+    // MuseScore's playback mark is attached to Note, while the separately
+    // painted stem/beam keeps the normal ink colour.
     final stemPaint = Paint()
-      ..color = noteColor
+      ..color = inkColor
       ..strokeWidth = active ? 2.2 : 1.6;
     final stemX = glyph.pitch != null && glyph.pitch! >= 71
         ? rect.left + 1.5
@@ -162,5 +194,6 @@ class ScorePagePainter extends CustomPainter {
       oldDelegate.page != page ||
       oldDelegate.activeEventIndexes != activeEventIndexes ||
       oldDelegate.inkColor != inkColor ||
-      oldDelegate.accentColor != accentColor;
+      oldDelegate.accentColor != accentColor ||
+      oldDelegate.playbackCursor != playbackCursor;
 }

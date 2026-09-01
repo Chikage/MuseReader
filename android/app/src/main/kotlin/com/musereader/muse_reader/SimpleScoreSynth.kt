@@ -24,9 +24,17 @@ class SimpleScoreSynth {
             val map = raw as? Map<*, *> ?: return@mapNotNull null
             val start = (map["startUs"] as? Number)?.toDouble() ?: return@mapNotNull null
             val end = (map["endUs"] as? Number)?.toDouble() ?: return@mapNotNull null
-            val pitch = (map["pitch"] as? Number)?.toInt() ?: 60
+            val pitch = ((map["pitch"] as? Number)?.toInt() ?: 60).coerceIn(0, 127)
+            val tuningValue = (map["tuning"] as? Number)?.toDouble()
+                ?: (map["cents"] as? Number)?.toDouble()
+                ?: 0.0
+            val tuning = if (tuningValue.isFinite()) {
+                tuningValue.coerceIn(-1_000_000.0, 1_000_000.0)
+            } else {
+                0.0
+            }
             val velocity = (map["velocity"] as? Number)?.toDouble() ?: 80.0
-            ToneEvent(start, max(start + 1.0, end), pitch, velocity)
+            ToneEvent(start, max(start + 1.0, end), pitch, tuning, velocity)
         }
         stop()
         if (events.isEmpty()) return
@@ -127,7 +135,13 @@ class SimpleScoreSynth {
             val attack = min(1.0, elapsed / 12_000.0)
             val release = min(1.0, (duration - elapsed) / 35_000.0)
             val envelope = min(attack, release)
-            val frequency = 440.0 * 2.0.pow((event.pitch - 69) / 12.0)
+            // MuseScore's Note::tuning is a cent offset from the integer MIDI
+            // key.  Apply it per oscillator voice so the fallback remains
+            // useful when the native FluidSynth library is unavailable.
+            val frequency = 440.0 * 2.0.pow(
+                ((event.pitch - 69) * 100.0 + event.tuning) / 1200.0,
+            )
+            if (!frequency.isFinite()) continue
             sum += sin(2.0 * PI * frequency * elapsed / 1_000_000.0) *
                 envelope * event.velocity / 127.0
         }
@@ -142,6 +156,7 @@ class SimpleScoreSynth {
         val startUs: Double,
         val endUs: Double,
         val pitch: Int,
+        val tuning: Double,
         val velocity: Double,
     )
 }

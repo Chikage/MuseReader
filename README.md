@@ -27,6 +27,14 @@ MuseReader 是一个 Android/iOS 双端 Flutter 只读谱面阅读器。它支�
 
 页面图像、音符 `startUs/endUs` 和 `Note::pageBoundingRect()` 均来自同一个已排版的 `MasterScore`。播放指针、拖动、变速、分页与高亮因此共享同一时间源和几何坐标，不经过 Flutter 的二次排版或 tick 估算。
 
+## 微分音播放
+
+MuseScore/Xen Tuner 等插件写入的每个音符 `Note::tuning`（单位为 cents）会随
+播放事件一路传递到原生 FluidSynth。音符的整数 MIDI `pitch` 与 cents 偏移分开
+保存，因此同一个 MIDI 键上的不同微分音可以同时发声，不会互相覆盖；带有
+MuseScore `<Events>` 的装饰音/分解播放事件也会保留其相对音高和时值。FluidSynth
+音频后端不可用时，Android/iOS 的兼容振荡器使用相同的频率公式作为开发期备用路径。
+
 ## 构建与打包
 
 要求 macOS、Xcode、Flutter、CMake、`curl`、`bsdtar`、`shasum`，以及相邻目录中的 MuseScore 源码：
@@ -74,6 +82,13 @@ flutter build ios --release --no-codesign \
 flutter analyze
 flutter test
 ```
+
+应用图标迁移自 MuseScore 3.6.2 的
+`assets/musescore-icon-round.svg`，项目内的源文件为
+`assets/branding/muse_reader_icon.svg`。平台 PNG 由配套的 macOS 渲染器
+生成；调整图标时同步更新 SVG 及 Android 自适应图标的前景矢量，然后运行
+`swift tool/generate_app_icons.swift`，即可重新生成 Android 各密度图标和
+iOS AppIcon 资源。
 
 脚本的 `verify` 模式还会检查 APK 只含 `arm64-v8a`、所需 Qt/NDK 运行库均已打包、iOS Runner/Flutter/App/原生 Framework 都只含 arm64，并确认 C ABI 导出符号存在。
 

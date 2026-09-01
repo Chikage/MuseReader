@@ -29,11 +29,20 @@ class _ReaderPageState extends State<ReaderPage> {
 
   void _onPlaybackChanged() {
     if (!mounted) return;
-    final page = _playback.currentPage;
-    if (page != _visiblePage &&
-        _playback.isPlaying &&
+    final cursor = _playback.cursorPosition;
+    final page = cursor?.pageIndex ?? _playback.currentPage;
+    final pageChanged = page != _visiblePage;
+    if (pageChanged &&
+        (_playback.isPlaying || _playback.cursorVisible) &&
         widget.document.pages.isNotEmpty) {
       _visiblePage = page;
+    }
+    if (cursor != null && _playback.cursorVisible) {
+      _scoreViewportKey.currentState?.followCursor(
+        cursor,
+        animate: _playback.isPlaying,
+      );
+    } else if (pageChanged && _playback.cursorVisible) {
       _scoreViewportKey.currentState?.focusPage(page);
     }
     setState(() {});
@@ -108,6 +117,7 @@ class _ReaderPageState extends State<ReaderPage> {
                 key: _scoreViewportKey,
                 document: widget.document,
                 activeEventIndexes: active,
+                playbackCursor: _playback.cursorPosition,
                 onPageChanged: (page) {
                   if (page != _visiblePage && mounted) {
                     setState(() => _visiblePage = page);
@@ -198,11 +208,13 @@ class _MultiPageScoreViewport extends StatefulWidget {
     super.key,
     required this.document,
     required this.activeEventIndexes,
+    required this.playbackCursor,
     required this.onPageChanged,
   });
 
   final ScoreDocument document;
   final Set<int> activeEventIndexes;
+  final ScoreCursorPosition? playbackCursor;
   final ValueChanged<int> onPageChanged;
 
   @override
@@ -228,7 +240,9 @@ class _MultiPageScoreViewportState extends State<_MultiPageScoreViewport>
   double _canvasHeight = 0;
   Size _viewportSize = Size.zero;
   int? _pendingPage;
+  ScoreCursorPosition? _pendingCursor;
   int _lastReportedPage = 0;
+  int? _lastFollowPage;
 
   @override
   void initState() {
@@ -280,6 +294,59 @@ class _MultiPageScoreViewportState extends State<_MultiPageScoreViewport>
       _transformationController.value = target;
     }
     _reportPage(safePage);
+    _lastFollowPage = null;
+  }
+
+  /// Keep the playback cursor in a comfortable reading position.  MuseScore
+  /// uses a smooth horizontal control cursor at roughly 30% of the viewport;
+  /// in this vertical page canvas we apply the same anchor to both axes and
+  /// only move when the cursor leaves a safety band.  This avoids restarting
+  /// an animation on every 16ms playback heartbeat.
+  void followCursor(ScoreCursorPosition cursor, {bool animate = true}) {
+    if (_pageTops.isEmpty || _viewportSize == Size.zero) {
+      _pendingCursor = cursor;
+      return;
+    }
+    if (cursor.pageIndex < 0 ||
+        cursor.pageIndex >= widget.document.pages.length) {
+      return;
+    }
+    final sceneRect = _sceneRectForCursor(cursor);
+    final matrix = _transformationController.value;
+    final scale = matrix.getMaxScaleOnAxis();
+    if (scale <= 0) return;
+    final screenRect = MatrixUtils.transformRect(matrix, sceneRect);
+    final pageChanged = _lastFollowPage != cursor.pageIndex;
+    final horizontalMargin = _viewportSize.width * 0.08;
+    final verticalMargin = _viewportSize.height * 0.14;
+    final safeRect = Rect.fromLTRB(
+      horizontalMargin,
+      verticalMargin,
+      math.max(horizontalMargin, _viewportSize.width - horizontalMargin),
+      math.max(verticalMargin, _viewportSize.height - verticalMargin),
+    );
+    if (!pageChanged && safeRect.contains(screenRect.center)) return;
+    if (!pageChanged && _animationController.isAnimating) return;
+
+    final targetX = _clampTranslationX(
+      _viewportSize.width * 0.30 - sceneRect.center.dx * scale,
+      scale,
+    );
+    final targetY = _clampTranslationY(
+      _viewportSize.height * 0.35 - sceneRect.center.dy * scale,
+      scale,
+    );
+    final translation = matrix.getTranslation();
+    final target = matrix.clone()
+      ..setTranslationRaw(targetX, targetY, translation.z);
+    if (animate) {
+      _animateTo(target);
+    } else {
+      _animationController.stop();
+      _transformationController.value = target;
+    }
+    _lastFollowPage = cursor.pageIndex;
+    _reportPage(cursor.pageIndex);
   }
 
   /// Restore the default fit-width view.  The canvas width is the viewport
@@ -288,6 +355,7 @@ class _MultiPageScoreViewportState extends State<_MultiPageScoreViewport>
   void resetView() {
     _animationController.stop();
     _transformationController.value = Matrix4.identity();
+    _lastFollowPage = null;
     _reportPage(0);
   }
 
@@ -311,6 +379,7 @@ class _MultiPageScoreViewportState extends State<_MultiPageScoreViewport>
 
   void _onInteractionStart(ScaleStartDetails _) {
     _animationController.stop();
+    _lastFollowPage = null;
   }
 
   void _onInteractionUpdate(ScaleUpdateDetails _) {
@@ -342,6 +411,25 @@ class _MultiPageScoreViewportState extends State<_MultiPageScoreViewport>
     return page;
   }
 
+  Rect _sceneRectForCursor(ScoreCursorPosition cursor) {
+    final pageIndex = cursor.pageIndex
+        .clamp(0, math.max(0, widget.document.pages.length - 1))
+        .toInt();
+    final page = widget.document.pages[pageIndex];
+    final pageWidth = math.max(1.0, _canvasWidth - _pageHorizontalInset * 2);
+    final safePageWidth = page.width <= 0 ? 1.0 : page.width;
+    final scaleX = pageWidth / safePageWidth;
+    final scaleY = page.height <= 0 ? scaleX : pageWidth / safePageWidth;
+    final pageTop = _pageTops[pageIndex];
+    final rect = cursor.rect;
+    return Rect.fromLTWH(
+      _pageHorizontalInset + rect.left * scaleX,
+      pageTop + rect.top * scaleY,
+      rect.width * scaleX,
+      rect.height * scaleY,
+    );
+  }
+
   void _reportPage(int page) {
     if (page == _lastReportedPage) return;
     _lastReportedPage = page;
@@ -360,6 +448,17 @@ class _MultiPageScoreViewportState extends State<_MultiPageScoreViewport>
       return (minTranslation + maxTranslation) / 2;
     }
     return translationY.clamp(minTranslation, maxTranslation).toDouble();
+  }
+
+  double _clampTranslationX(double translationX, double scale) {
+    final scaledWidth = _canvasWidth * scale;
+    final minTranslation =
+        _viewportSize.width - scaledWidth - _boundaryMargin.right;
+    final maxTranslation = _boundaryMargin.left;
+    if (minTranslation > maxTranslation) {
+      return (minTranslation + maxTranslation) / 2;
+    }
+    return translationX.clamp(minTranslation, maxTranslation).toDouble();
   }
 
   ({List<double> tops, double height}) _layoutMetrics(double width) {
@@ -398,6 +497,15 @@ class _MultiPageScoreViewportState extends State<_MultiPageScoreViewport>
         if (mounted && page != null) focusPage(page, animate: false);
       });
     }
+    if (changed && _pendingCursor != null) {
+      final cursor = _pendingCursor;
+      _pendingCursor = null;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && cursor != null) {
+          followCursor(cursor, animate: false);
+        }
+      });
+    }
   }
 
   @override
@@ -422,7 +530,11 @@ class _MultiPageScoreViewportState extends State<_MultiPageScoreViewport>
                 pageNumber: index,
                 width: pageWidth,
                 activeEventIndexes: widget.activeEventIndexes,
+                playbackCursor: widget.playbackCursor?.pageIndex == index
+                    ? widget.playbackCursor!.rect
+                    : null,
                 activePageRects: _activePageRects(index),
+                activeNotes: _activeNotes(index),
               ),
             ),
         ];
@@ -461,6 +573,14 @@ class _MultiPageScoreViewportState extends State<_MultiPageScoreViewport>
             widget.document.events[eventIndex].pageRect != null)
           widget.document.events[eventIndex].pageRect!,
   ];
+
+  List<PlaybackEvent> _activeNotes(int pageIndex) => [
+    for (final eventIndex in widget.activeEventIndexes)
+      if (eventIndex >= 0 && eventIndex < widget.document.events.length)
+        if (widget.document.events[eventIndex].pageIndex == pageIndex &&
+            widget.document.events[eventIndex].pageRect != null)
+          widget.document.events[eventIndex],
+  ];
 }
 
 class _PageViewport extends StatelessWidget {
@@ -469,14 +589,18 @@ class _PageViewport extends StatelessWidget {
     required this.pageNumber,
     required this.width,
     required this.activeEventIndexes,
+    required this.playbackCursor,
     required this.activePageRects,
+    required this.activeNotes,
   });
 
   final ScorePage page;
   final int pageNumber;
   final double width;
   final Set<int> activeEventIndexes;
+  final ScoreRect? playbackCursor;
   final List<ScoreRect> activePageRects;
+  final List<PlaybackEvent> activeNotes;
 
   @override
   Widget build(BuildContext context) {
@@ -501,7 +625,9 @@ class _PageViewport extends StatelessWidget {
                       pageWidth: page.width,
                       pageHeight: page.height,
                       rects: activePageRects,
-                      color: theme.colorScheme.primary,
+                      notes: activeNotes,
+                      cursor: playbackCursor,
+                      color: museScorePlaybackColor,
                     ),
                   ),
                 ),
@@ -514,7 +640,8 @@ class _PageViewport extends StatelessWidget {
               page: page,
               activeEventIndexes: activeEventIndexes,
               inkColor: theme.colorScheme.onSurface,
-              accentColor: theme.colorScheme.primary,
+              accentColor: museScorePlaybackColor,
+              playbackCursor: playbackCursor,
             ),
           );
     return Semantics(
@@ -534,12 +661,16 @@ class _PlaybackOverlayPainter extends CustomPainter {
     required this.pageWidth,
     required this.pageHeight,
     required this.rects,
+    this.notes = const [],
+    this.cursor,
     required this.color,
   });
 
   final double pageWidth;
   final double pageHeight;
   final List<ScoreRect> rects;
+  final List<PlaybackEvent> notes;
+  final ScoreRect? cursor;
   final Color color;
 
   @override
@@ -547,32 +678,80 @@ class _PlaybackOverlayPainter extends CustomPainter {
     if (pageWidth <= 0 || pageHeight <= 0) return;
     final scaleX = size.width / pageWidth;
     final scaleY = size.height / pageHeight;
-    final fill = Paint()
-      ..color = color.withValues(alpha: 0.24)
-      ..style = PaintingStyle.fill;
-    final outline = Paint()
-      ..color = color.withValues(alpha: 0.9)
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 1.5;
-    for (final rect in rects) {
-      final highlight = Rect.fromLTWH(
-        rect.left * scaleX,
-        rect.top * scaleY,
-        rect.width * scaleX,
-        rect.height * scaleY,
-      ).inflate(3);
-      final rounded = RRect.fromRectAndRadius(
-        highlight,
-        const Radius.circular(3),
+    final pageRect = Rect.fromLTWH(0, 0, size.width, size.height);
+
+    // MuseScore marks every sounding note with the voice colour before it
+    // paints the translucent position cursor.  Native pages are rasterized,
+    // so reproduce the notehead/stem silhouette in the small note bounding
+    // rectangles supplied by the bridge.
+    for (final note in notes) {
+      final noteRect = note.pageRect;
+      if (noteRect == null || !noteRect.isFinite) continue;
+      _drawMarkedNote(
+        canvas,
+        Rect.fromLTWH(
+          noteRect.left * scaleX,
+          noteRect.top * scaleY,
+          noteRect.width * scaleX,
+          noteRect.height * scaleY,
+        ),
       );
-      canvas.drawRRect(rounded, fill);
-      canvas.drawRRect(rounded, outline);
     }
+    // Keep compatibility with callers that only have rectangles (documents
+    // produced by an older bridge).  These are deliberately subtle and do
+    // not recreate the old rounded selection boxes.
+    if (notes.isEmpty) {
+      final mark = Paint()..color = color;
+      for (final rect in rects) {
+        final scaled = Rect.fromLTWH(
+          rect.left * scaleX,
+          rect.top * scaleY,
+          rect.width * scaleX,
+          rect.height * scaleY,
+        );
+        canvas.drawOval(scaled, mark);
+      }
+    }
+
+    final cursorRect = cursor;
+    if (cursorRect == null || !cursorRect.isFinite) return;
+    final scaledCursor = Rect.fromLTWH(
+      cursorRect.left * scaleX,
+      cursorRect.top * scaleY,
+      cursorRect.width * scaleX,
+      cursorRect.height * scaleY,
+    ).intersect(pageRect);
+    if (scaledCursor.isEmpty) return;
+    final cursorPaint = Paint()
+      ..color = color.withValues(alpha: 50 / 255.0)
+      ..style = PaintingStyle.fill;
+    canvas.drawRect(scaledCursor, cursorPaint);
+  }
+
+  void _drawMarkedNote(Canvas canvas, Rect rect) {
+    if (rect.isEmpty) return;
+    final headPaint = Paint()
+      ..color = color
+      ..style = PaintingStyle.fill;
+    canvas.save();
+    canvas.translate(rect.center.dx, rect.center.dy);
+    canvas.rotate(-0.22);
+    canvas.drawOval(
+      Rect.fromCenter(
+        center: Offset.zero,
+        width: rect.width,
+        height: rect.height,
+      ),
+      headPaint,
+    );
+    canvas.restore();
   }
 
   @override
   bool shouldRepaint(covariant _PlaybackOverlayPainter oldDelegate) =>
       oldDelegate.rects != rects ||
+      oldDelegate.notes != notes ||
+      oldDelegate.cursor != cursor ||
       oldDelegate.pageWidth != pageWidth ||
       oldDelegate.pageHeight != pageHeight ||
       oldDelegate.color != color;

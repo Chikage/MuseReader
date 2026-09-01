@@ -74,6 +74,16 @@ if(MUSE_READER_WITH_MUSESCORE)
     message(FATAL_ERROR "Set MUSESCORE_SOURCE_DIR to the MuseScore-3.6.2 checkout")
   endif()
 
+  # Qt's 5.15 package files are shipped with absolute module paths.  When a
+  # cross-compiling sysroot is active, newer CMake releases prepend that
+  # sysroot to those already-absolute paths and report Qt5Core (and friends)
+  # as missing.  The Qt kit is explicitly selected below, so package lookup
+  # must stay outside the target sysroot; library lookup still follows the
+  # normal platform toolchain rules.
+  if(ANDROID OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE NEVER)
+  endif()
+
   if(MUSE_READER_BUILD_MUSESCORE_SOURCE)
     find_package(Qt5 5.15 REQUIRED COMPONENTS Core Gui Widgets Xml Svg)
     find_package(ZLIB REQUIRED)
