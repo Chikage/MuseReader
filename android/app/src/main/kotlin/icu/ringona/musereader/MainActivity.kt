@@ -6,6 +6,7 @@ import android.database.Cursor
 import android.net.Uri
 import android.os.Bundle
 import android.provider.OpenableColumns
+import android.util.Log
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -20,6 +21,7 @@ class MainActivity : FlutterActivity() {
         private const val ENGINE_CHANNEL = "com.musereader/musescore_engine"
         private const val PICK_SCORE_REQUEST = 4101
         private const val IMPORT_DIRECTORY = "muse_reader/imports"
+        private const val TAG = "MuseReaderAudio"
     }
 
     private var pendingFileResult: MethodChannel.Result? = null
@@ -101,6 +103,7 @@ class MainActivity : FlutterActivity() {
                         val speed = (call.argument<Number>("speed") ?: 1.0).toDouble()
                         fallbackSynth.stop()
                         if (!fluidSynth.start(events, positionUs, speed)) {
+                            Log.w(TAG, "Native FluidSynth unavailable; using oscillator fallback")
                             fallbackSynth.start(events, positionUs, speed)
                         }
                         result.success(null)

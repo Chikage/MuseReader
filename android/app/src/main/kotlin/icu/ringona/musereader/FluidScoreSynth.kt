@@ -28,15 +28,23 @@ class FluidScoreSynth {
     private var basePositionUs = 0L
     private var playbackSpeed = 1.0
     private var playbackSampleRate = 44_100
+    private var writtenFrames = 0L
     private var lastPositionUs = 0L
 
     /** Starts native playback, returning false when the embedded renderer is unavailable. */
     fun start(rawEvents: List<Any?>, positionUs: Long, speed: Double): Boolean {
         stop()
         val eventsJson = encodeEvents(rawEvents)
-        if (eventsJson == "[]") return false
-        if (!NativeMuseScoreEngine.audioIsAvailable()) return false
+        if (eventsJson == "[]") {
+            Log.w(TAG, "Native playback skipped: empty event list")
+            return false
+        }
+        if (!NativeMuseScoreEngine.audioIsAvailable()) {
+            logNativeFailure("Native FluidSynth is unavailable")
+            return false
+        }
         if (!NativeMuseScoreEngine.audioStartJson(eventsJson, positionUs, speed)) {
+            logNativeFailure("Native FluidSynth rejected the audio event stream")
             return false
         }
 
@@ -82,6 +90,7 @@ class FluidScoreSynth {
             basePositionUs = positionUs.coerceAtLeast(0L)
             playbackSpeed = if (speed.isFinite()) speed.coerceAtLeast(0.0) else 1.0
             playbackSampleRate = sampleRate.coerceAtLeast(1)
+            writtenFrames = 0L
             lastPositionUs = basePositionUs
         }
         val thread = Thread {
@@ -105,6 +114,7 @@ class FluidScoreSynth {
                 basePositionUs = basePositionUs,
                 speed = playbackSpeed,
                 sampleRate = playbackSampleRate,
+                writtenFrames = writtenFrames,
                 lastPositionUs = lastPositionUs,
             )
         } ?: return null
@@ -114,6 +124,7 @@ class FluidScoreSynth {
             basePositionUs = snapshot.basePositionUs,
             speed = snapshot.speed,
             sampleRate = snapshot.sampleRate,
+            writtenFrames = snapshot.writtenFrames,
             lastPositionUs = snapshot.lastPositionUs,
         )
         return synchronized(lock) {
@@ -135,6 +146,7 @@ class FluidScoreSynth {
             basePositionUs = 0L
             playbackSpeed = 1.0
             playbackSampleRate = 44_100
+            writtenFrames = 0L
             lastPositionUs = 0L
         }
         NativeMuseScoreEngine.audioStop()
@@ -199,7 +211,9 @@ class FluidScoreSynth {
                     offset += written
                 }
                 if (offset <= 0) break
-                bufferedFrames += offset / 2
+                val blockFrames = offset / 2
+                recordWrittenFrames(audio, blockFrames)
+                bufferedFrames += blockFrames
                 if (offset < sampleCount) break
             }
             if (!isCurrent(localGeneration) || bufferedFrames <= 0) return
@@ -224,8 +238,10 @@ class FluidScoreSynth {
                     if (written <= 0) break
                     offset += written
                 }
+                if (offset > 0) recordWrittenFrames(audio, offset / 2)
                 if (offset < sampleCount && isCurrent(localGeneration)) break
             }
+            if (isCurrent(localGeneration)) waitForDrain(audio, localGeneration)
         } catch (error: Throwable) {
             if (isCurrent(localGeneration)) Log.w(TAG, "FluidSynth audio stream stopped", error)
         } finally {
@@ -250,11 +266,45 @@ class FluidScoreSynth {
         generation == localGeneration && !Thread.currentThread().isInterrupted
     }
 
+    private fun recordWrittenFrames(audio: AudioTrack, frames: Int) {
+        if (frames <= 0) return
+        synchronized(lock) {
+            if (track === audio) writtenFrames += frames.toLong()
+        }
+    }
+
+    private fun waitForDrain(audio: AudioTrack, localGeneration: Int) {
+        val targetFrames = synchronized(lock) {
+            if (track === audio) writtenFrames else 0L
+        }
+        if (targetFrames <= 0L) return
+        val deadlineNanos = System.nanoTime() + 2_000_000_000L
+        while (isCurrent(localGeneration) && System.nanoTime() < deadlineNanos) {
+            val presentedFrames = try {
+                audio.playbackHeadPosition.toLong() and 0xffffffffL
+            } catch (_: IllegalStateException) {
+                return
+            }
+            if (presentedFrames >= targetFrames) return
+            Thread.sleep(5)
+        }
+    }
+
+    private fun logNativeFailure(prefix: String) {
+        val detail = NativeMuseScoreEngine.audioLastError()
+        if (detail.isNullOrBlank()) {
+            Log.w(TAG, prefix)
+        } else {
+            Log.w(TAG, "$prefix: $detail")
+        }
+    }
+
     private data class TrackSnapshot(
         val audio: AudioTrack,
         val basePositionUs: Long,
         val speed: Double,
         val sampleRate: Int,
+        val writtenFrames: Long,
         val lastPositionUs: Long,
     )
 

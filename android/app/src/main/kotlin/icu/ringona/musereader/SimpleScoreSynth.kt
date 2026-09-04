@@ -21,6 +21,7 @@ class SimpleScoreSynth {
     private var generation = 0
     private var basePositionUs = 0L
     private var playbackSpeed = 1.0
+    private var writtenFrames = 0L
     private var lastPositionUs = 0L
 
     fun start(rawEvents: List<Any?>, positionUs: Long, speed: Double) {
@@ -69,6 +70,7 @@ class SimpleScoreSynth {
             localGeneration = generation
             basePositionUs = positionUs.coerceAtLeast(0L)
             playbackSpeed = if (speed.isFinite()) speed.coerceAtLeast(0.0) else 1.0
+            writtenFrames = 0L
             lastPositionUs = basePositionUs
         }
         worker = Thread {
@@ -108,7 +110,8 @@ class SimpleScoreSynth {
                     }
                     val written = audio.write(buffer, 0, buffer.size)
                     if (written <= 0) break
-                    frame += buffer.size
+                    frame += written
+                    recordWrittenFrames(audio, written)
                     bufferedFrames += written
                     if (written < buffer.size) break
                 }
@@ -125,8 +128,15 @@ class SimpleScoreSynth {
                             .toShort()
                         if (sample != 0.0) hasSound = true
                     }
-                    audio.write(buffer, 0, buffer.size)
-                    frame += buffer.size
+                    var offset = 0
+                    while (offset < buffer.size && isCurrent(localGeneration)) {
+                        val written = audio.write(buffer, offset, buffer.size - offset)
+                        if (written <= 0) break
+                        offset += written
+                    }
+                    frame += offset
+                    recordWrittenFrames(audio, offset)
+                    if (offset < buffer.size && isCurrent(localGeneration)) break
                     val lastEnd = events.maxOf { it.endUs }
                     if (positionUs +
                             frame * 1_000_000.0 / sampleRate * speed >= lastEnd &&
@@ -135,6 +145,7 @@ class SimpleScoreSynth {
                         break
                     }
                 }
+                if (isCurrent(localGeneration)) waitForDrain(audio, localGeneration)
             } finally {
                 try {
                     audio.stop()
@@ -159,6 +170,7 @@ class SimpleScoreSynth {
                 audio = current,
                 basePositionUs = basePositionUs,
                 speed = playbackSpeed,
+                writtenFrames = writtenFrames,
                 lastPositionUs = lastPositionUs,
             )
         } ?: return null
@@ -168,6 +180,7 @@ class SimpleScoreSynth {
             basePositionUs = snapshot.basePositionUs,
             speed = snapshot.speed,
             sampleRate = sampleRate,
+            writtenFrames = snapshot.writtenFrames,
             lastPositionUs = snapshot.lastPositionUs,
         )
         return synchronized(lock) {
@@ -188,6 +201,7 @@ class SimpleScoreSynth {
             track = null
             basePositionUs = 0L
             playbackSpeed = 1.0
+            writtenFrames = 0L
             lastPositionUs = 0L
         }
         worker?.interrupt()
@@ -198,10 +212,35 @@ class SimpleScoreSynth {
         generation == localGeneration && !Thread.currentThread().isInterrupted
     }
 
+    private fun recordWrittenFrames(audio: AudioTrack, frames: Int) {
+        if (frames <= 0) return
+        synchronized(lock) {
+            if (track === audio) writtenFrames += frames.toLong()
+        }
+    }
+
+    private fun waitForDrain(audio: AudioTrack, localGeneration: Int) {
+        val targetFrames = synchronized(lock) {
+            if (track === audio) writtenFrames else 0L
+        }
+        if (targetFrames <= 0L) return
+        val deadlineNanos = System.nanoTime() + 2_000_000_000L
+        while (isCurrent(localGeneration) && System.nanoTime() < deadlineNanos) {
+            val presentedFrames = try {
+                audio.playbackHeadPosition.toLong() and 0xffffffffL
+            } catch (_: IllegalStateException) {
+                return
+            }
+            if (presentedFrames >= targetFrames) return
+            Thread.sleep(5)
+        }
+    }
+
     private data class TrackSnapshot(
         val audio: AudioTrack,
         val basePositionUs: Long,
         val speed: Double,
+        val writtenFrames: Long,
         val lastPositionUs: Long,
     )
 

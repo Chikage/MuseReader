@@ -18,6 +18,8 @@ final class SimpleScoreSynth {
   private var speed = 1.0
   private var frameCursor: Int64 = 0
   private var sampleRate = 44_100.0
+  private var presentationLatencyFrames: Int64 = 0
+  private var lastPositionUs: Int64 = 0
 
   func start(events rawEvents: [[String: Any]], positionUs: Int64, speed: Double) {
     let events = rawEvents.compactMap { raw -> ToneEvent? in
@@ -66,10 +68,12 @@ final class SimpleScoreSynth {
 
     lock.lock()
     self.events = events
-    basePositionUs = Double(positionUs)
-    self.speed = max(0.1, speed)
+    basePositionUs = Double(max(0, positionUs))
+    self.speed = normalizedSpeed(speed)
     frameCursor = 0
     sampleRate = format.sampleRate
+    presentationLatencyFrames = 0
+    lastPositionUs = max(0, positionUs)
     engine = newEngine
     sourceNode = newSourceNode
     lock.unlock()
@@ -77,9 +81,31 @@ final class SimpleScoreSynth {
     newEngine.prepare()
     do {
       try newEngine.start()
+      let latencyFrames = outputLatencyFrames(
+        engine: newEngine,
+        session: session,
+        sampleRate: format.sampleRate
+      )
+      lock.lock()
+      if engine === newEngine {
+        presentationLatencyFrames = latencyFrames
+      }
+      lock.unlock()
     } catch {
       stop()
     }
+  }
+
+  /// Score position of the oscillator frames that have reached the output route.
+  func positionUs() -> Int64? {
+    lock.lock()
+    defer { lock.unlock() }
+    guard engine != nil, !events.isEmpty else { return nil }
+    let presentedFrames = max(0, frameCursor - presentationLatencyFrames)
+    let elapsedUs = Double(presentedFrames) / sampleRate * 1_000_000 * speed
+    let position = Int64(basePositionUs + elapsedUs.rounded())
+    lastPositionUs = max(lastPositionUs, position)
+    return lastPositionUs
   }
 
   func stop() {
@@ -90,6 +116,8 @@ final class SimpleScoreSynth {
     sourceNode = nil
     events.removeAll(keepingCapacity: true)
     frameCursor = 0
+    presentationLatencyFrames = 0
+    lastPositionUs = 0
     lock.unlock()
 
     oldEngine?.stop()
@@ -145,6 +173,20 @@ final class SimpleScoreSynth {
         memset(data, 0, Int(buffer.mDataByteSize))
       }
     }
+  }
+
+  private func outputLatencyFrames(
+    engine: AVAudioEngine,
+    session: AVAudioSession,
+    sampleRate: Double
+  ) -> Int64 {
+    let sessionLatency = session.outputLatency + session.ioBufferDuration
+    let engineLatency = engine.outputNode.presentationLatency
+    return Int64(ceil(max(0, max(sessionLatency, engineLatency)) * sampleRate))
+  }
+
+  private func normalizedSpeed(_ speed: Double) -> Double {
+    speed.isFinite ? min(4, max(0.1, speed)) : 1
   }
 
   private func sampleAt(events: [ToneEvent], timeUs: Double) -> Double {

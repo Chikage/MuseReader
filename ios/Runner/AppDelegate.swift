@@ -99,6 +99,8 @@ import UIKit
         self.fluidSynth.stop()
         self.fallbackSynth.stop()
         result(nil)
+      case "audioPositionUs":
+        result(self.fluidSynth.positionUs() ?? self.fallbackSynth.positionUs())
       default:
         result(FlutterMethodNotImplemented)
       }

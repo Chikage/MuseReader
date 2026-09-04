@@ -9,6 +9,12 @@ final class FluidScoreSynth {
   private var sourceNode: AVAudioSourceNode?
   private var rendering = false
   private var scratch = [Float]()
+  private var basePositionUs: Int64 = 0
+  private var playbackSpeed = 1.0
+  private var sampleRate = 44_100.0
+  private var submittedFrames: Int64 = 0
+  private var presentationLatencyFrames: Int64 = 0
+  private var lastPositionUs: Int64 = 0
 
   @discardableResult
   func start(events: [[String: Any]], positionUs: Int64, speed: Double) -> Bool {
@@ -54,16 +60,44 @@ final class FluidScoreSynth {
     engine = newEngine
     sourceNode = newSourceNode
     rendering = true
+    basePositionUs = max(0, positionUs)
+    playbackSpeed = normalizedSpeed(speed)
+    self.sampleRate = sampleRate
+    submittedFrames = 0
+    presentationLatencyFrames = 0
+    lastPositionUs = basePositionUs
     lock.unlock()
 
     newEngine.prepare()
     do {
       try newEngine.start()
+      let latencyFrames = outputLatencyFrames(
+        engine: newEngine,
+        session: session,
+        sampleRate: sampleRate
+      )
+      lock.lock()
+      if engine === newEngine {
+        presentationLatencyFrames = latencyFrames
+      }
+      lock.unlock()
       return true
     } catch {
       stop()
       return false
     }
+  }
+
+  /// Score position of the audio frames that have reached the output route.
+  func positionUs() -> Int64? {
+    lock.lock()
+    defer { lock.unlock() }
+    guard engine != nil, rendering else { return nil }
+    let presentedFrames = max(0, submittedFrames - presentationLatencyFrames)
+    let elapsedUs = Double(presentedFrames) * 1_000_000 / sampleRate * playbackSpeed
+    let position = basePositionUs + Int64(elapsedUs.rounded())
+    lastPositionUs = max(lastPositionUs, position)
+    return lastPositionUs
   }
 
   func stop() {
@@ -73,6 +107,12 @@ final class FluidScoreSynth {
     engine = nil
     sourceNode = nil
     rendering = false
+    basePositionUs = 0
+    playbackSpeed = 1
+    sampleRate = 44_100
+    submittedFrames = 0
+    presentationLatencyFrames = 0
+    lastPositionUs = 0
     lock.unlock()
 
     oldEngine?.stop()
@@ -114,8 +154,23 @@ final class FluidScoreSynth {
       return Int(muse_reader_audio_render(baseAddress, frameCount))
     }
     copy(samples: scratch, to: buffers, frameCount: frameCount)
+    submittedFrames += Int64(frameCount)
     lock.unlock()
     return rendered > 0
+  }
+
+  private func outputLatencyFrames(
+    engine: AVAudioEngine,
+    session: AVAudioSession,
+    sampleRate: Double
+  ) -> Int64 {
+    let sessionLatency = session.outputLatency + session.ioBufferDuration
+    let engineLatency = engine.outputNode.presentationLatency
+    return Int64(ceil(max(0, max(sessionLatency, engineLatency)) * sampleRate))
+  }
+
+  private func normalizedSpeed(_ speed: Double) -> Double {
+    speed.isFinite ? min(4, max(0.1, speed)) : 1
   }
 
   private func copy(
@@ -129,7 +184,8 @@ final class FluidScoreSynth {
       let channels = max(1, Int(buffers[0].mNumberChannels))
       if channels == 2 {
         samples.withUnsafeBufferPointer { source in
-          data.update(from: source.baseAddress!, count: frameCount * 2)
+          guard let baseAddress = source.baseAddress else { return }
+          data.update(from: baseAddress, count: frameCount * 2)
         }
       } else {
         for frame in 0..<frameCount {

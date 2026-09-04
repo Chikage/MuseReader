@@ -1,4 +1,5 @@
 #include "muse_reader_engine.h"
+#include "muse_reader_audio_internal.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -33,10 +34,12 @@
 #include <map>
 #include <memory>
 #include <tuple>
+#include <vector>
 
 #include "chord.h"
 #include "element.h"
 #include "event.h"
+#include "instrtemplate.h"
 #include "instrument.h"
 #include "measure.h"
 #include "mscore.h"
@@ -46,10 +49,13 @@
 #include "repeatlist.h"
 #include "segment.h"
 #include "score.h"
+#include "scoreOrder.h"
 #include "staff.h"
 #include "synthesizerstate.h"
 #include "system.h"
 #include "tempo.h"
+#include "text.h"
+#include "tie.h"
 #include "preferences.h"
 
 #ifndef MUSE_READER_RENDER_DPI
@@ -201,6 +207,16 @@ bool initialize_musescore() {
   Ms::MScore::svgPrinting = false;
   Ms::MScore::init();
   Ms::preferences.init(true);
+#if defined(MUSE_READER_BUILD_MUSESCORE_SOURCE)
+  // The desktop bootstrap loads these catalogs before opening scores.  They
+  // provide the instrument/drumset and score-order defaults used when older
+  // files omit an explicit channel definition.
+  if (!Ms::loadInstrumentTemplates(QStringLiteral(":/data/instruments.xml"))) {
+    set_error(QStringLiteral("Missing MuseScore instrument catalog"));
+    return false;
+  }
+  Ms::loadScoreOrders(QStringLiteral(":/data/orders.xml"));
+#endif
   core = std::make_unique<Ms::MuseScoreCore>();
   initialized = true;
   return true;
@@ -239,6 +255,106 @@ class RenderStateGuard {
   bool old_pdf_printing_;
   double old_pixel_ratio_;
 };
+
+bool is_title_frame_text(const Ms::Text* text) {
+  if (!text || !text->visible() || !text->parent() ||
+      !text->parent()->isVBox()) {
+    return false;
+  }
+
+  switch (text->tid()) {
+    case Ms::Tid::TITLE:
+    case Ms::Tid::SUBTITLE:
+    case Ms::Tid::COMPOSER:
+    case Ms::Tid::POET:
+    case Ms::Tid::TRANSLATOR:
+    case Ms::Tid::INSTRUMENT_EXCERPT:
+      return true;
+    default:
+      return false;
+  }
+}
+
+QRectF visible_text_rect(const Ms::Text* text) {
+  QRectF result;
+  bool has_visible_text = false;
+  for (int row = 0; row < text->rows(); ++row) {
+    const Ms::TextBlock& block = text->textBlock(row);
+    bool block_has_visible_text = false;
+    for (const Ms::TextFragment& fragment : block.fragments()) {
+      if (!fragment.text.trimmed().isEmpty()) {
+        block_has_visible_text = true;
+        break;
+      }
+    }
+    if (!block_has_visible_text) continue;
+
+    const QRectF block_rect =
+        block.boundingRect().translated(0.0, block.y());
+    result = has_visible_text ? result.united(block_rect) : block_rect;
+    has_visible_text = true;
+  }
+  return has_visible_text ? result.translated(text->pagePos()) : QRectF();
+}
+
+bool visible_text_overlaps(const Ms::Text* first, const Ms::Text* second) {
+  const QRectF overlap =
+      visible_text_rect(first).intersected(visible_text_rect(second));
+  constexpr qreal kMinimumOverlap = 0.25;
+  return overlap.width() > kMinimumOverlap &&
+         overlap.height() > kMinimumOverlap;
+}
+
+bool trim_trailing_line_breaks(Ms::Text* text) {
+  QString contents = text->xmlText();
+  const int original_size = contents.size();
+  while (!contents.isEmpty() &&
+         (contents.endsWith(QLatin1Char('\n')) ||
+          contents.endsWith(QLatin1Char('\r')))) {
+    contents.chop(1);
+  }
+  if (contents.size() == original_size) return false;
+  text->setXmlText(contents);
+  return true;
+}
+
+bool repair_title_frame_text_collisions(Ms::MasterScore* score) {
+  std::map<const Ms::Element*, std::vector<Ms::Text*>> text_by_frame;
+  for (Ms::Page* page : score->pages()) {
+    for (Ms::Element* element : page->elements()) {
+      if (!element->isText()) continue;
+      auto* text = static_cast<Ms::Text*>(element);
+      if (is_title_frame_text(text)) {
+        text_by_frame[text->parent()].push_back(text);
+      }
+    }
+  }
+
+  bool repaired = false;
+  for (const auto& entry : text_by_frame) {
+    const std::vector<Ms::Text*>& texts = entry.second;
+    std::vector<bool> collides(texts.size(), false);
+    for (size_t first = 0; first < texts.size(); ++first) {
+      for (size_t second = first + 1; second < texts.size(); ++second) {
+        if (visible_text_overlaps(texts[first], texts[second])) {
+          collides[first] = true;
+          collides[second] = true;
+        }
+      }
+    }
+
+    // MuseScore 3.x includes trailing blank paragraphs in bottom-aligned text
+    // geometry. Some imported scores then offset adjacent credit lines back on
+    // top of one another. Remove only those invisible paragraphs, and only in
+    // title-frame text whose visible glyphs are already colliding.
+    for (size_t index = 0; index < texts.size(); ++index) {
+      if (collides[index]) {
+        repaired = trim_trailing_line_breaks(texts[index]) || repaired;
+      }
+    }
+  }
+  return repaired;
+}
 
 RenderedPage render_page(Ms::MasterScore* score, int page_index) {
   Ms::Page* page = score->pages().at(page_index);
@@ -413,7 +529,82 @@ struct PendingNote {
   // clicks seek the parent ChordRest tick.
   int source_tick = -1;
   qint64 click_start_us = -1;
+  QJsonArray highlight_rects;
 };
+
+void append_highlight_rect(QJsonArray* highlights,
+                           Ms::MasterScore* score,
+                           Ms::Page* page,
+                           const QRectF& page_rect) {
+  if (!highlights || !score || !page) return;
+  const int page_index = score->pageIdx(page);
+  if (page_index < 0) return;
+  const QRectF page_box = page->abbox();
+  const QRectF relative = page_rect.translated(-page_box.topLeft()).normalized();
+  const QRectF clipped = relative.intersected(
+      QRectF(0.0, 0.0, page_box.width(), page_box.height()));
+  if (clipped.isEmpty() || !qIsFinite(clipped.left()) ||
+      !qIsFinite(clipped.top()) || !qIsFinite(clipped.width()) ||
+      !qIsFinite(clipped.height())) {
+    return;
+  }
+
+  QJsonObject rect;
+  rect.insert("x", clipped.x());
+  rect.insert("y", clipped.y());
+  rect.insert("width", clipped.width());
+  rect.insert("height", clipped.height());
+  QJsonObject highlight;
+  highlight.insert("page", page_index);
+  highlight.insert("rect", rect);
+  highlights->append(highlight);
+}
+
+QJsonArray tied_highlight_rects(Ms::MasterScore* score,
+                                const Ms::Note* source_note) {
+  QJsonArray highlights;
+  if (!score || !source_note) return highlights;
+  const std::vector<Ms::Note*> tied_notes = source_note->tiedNotes();
+  if (tied_notes.size() < 2) return highlights;
+
+  for (const Ms::Note* note : tied_notes) {
+    if (!note || !note->visible() || note->hidden() || !note->chord() ||
+        !note->chord()->measure() || !note->chord()->measure()->system()) {
+      continue;
+    }
+    Ms::Page* page = note->chord()->measure()->system()->page();
+    append_highlight_rect(&highlights, score, page,
+                          note->pageBoundingRect());
+
+    Ms::Tie* tie = note->tieFor();
+    if (!tie) continue;
+    const Ms::Note* end_note = tie->endNote();
+    if (end_note && end_note->chord() &&
+        end_note->chord()->crossMeasure() == Ms::CrossMeasure::SECOND) {
+      continue;
+    }
+    for (const Ms::SpannerSegment* raw_segment : tie->spannerSegments()) {
+      if (!raw_segment || !raw_segment->visible() || !raw_segment->system() ||
+          !raw_segment->system()->page()) {
+        continue;
+      }
+      const auto* segment = static_cast<const Ms::TieSegment*>(raw_segment);
+      Ms::Page* segment_page = segment->system()->page();
+      const Ms::Shape shape = segment->shape();
+      if (shape.empty()) {
+        append_highlight_rect(&highlights, score, segment_page,
+                              segment->pageBoundingRect());
+        continue;
+      }
+      const QPointF page_offset = segment->pagePos();
+      for (const QRectF& shape_rect : shape) {
+        append_highlight_rect(&highlights, score, segment_page,
+                              shape_rect.translated(page_offset));
+      }
+    }
+  }
+  return highlights;
+}
 
 bool notehead_is_filled(const Ms::Note* note) {
   if (!note || !note->chord()) return true;
@@ -633,6 +824,8 @@ QJsonObject note_json(
   if (note.source_tick >= 0) result.insert("sourceTick", note.source_tick);
   if (note.click_start_us >= 0)
     result.insert("clickStartUs", note.click_start_us);
+  if (!note.highlight_rects.isEmpty())
+    result.insert("highlightRects", note.highlight_rects);
   result.insert("pitch", note.pitch);
   result.insert("tuning", Ms::normalizedPlayEventTuning(note.tuning));
   result.insert("noteheadFilled", note.notehead_filled);
@@ -673,6 +866,70 @@ QJsonObject note_json(
   return result;
 }
 
+// Keep non-note MIDI actions in a separate stream so the Flutter document
+// model can continue exposing the note-only event list used by the renderer.
+// This mirrors the events sent by Seq::initInstruments() and
+// Seq::playEvent(), including expressive CC2 dynamics and pitch bends.
+bool append_audio_event(QJsonArray* events,
+                        qint64 time_us,
+                        const Ms::MidiCoreEvent& event) {
+  if (!events) return false;
+
+  QJsonObject result;
+  result.insert("timeUs", qMax<qint64>(0, time_us));
+  result.insert("channel",
+                qBound(0, static_cast<int>(event.channel()), 255));
+
+  switch (event.type()) {
+    case Ms::ME_CONTROLLER: {
+      const int controller = event.controller();
+      if (controller == Ms::CTRL_PRESS) {
+        result.insert("kind", QStringLiteral("aftertouch"));
+        result.insert("value", qBound(0, event.dataB(), 127));
+      } else if (controller == Ms::CTRL_POLYAFTER) {
+        const int packed = event.dataB();
+        result.insert("kind", QStringLiteral("polyAfter"));
+        result.insert("pitch", qBound(0, (packed >> 8) & 0x7f, 127));
+        result.insert("value", qBound(0, packed & 0x7f, 127));
+      } else if (controller == Ms::CTRL_PROGRAM ||
+                 (controller >= 0 && controller <= 127)) {
+        result.insert("kind", QStringLiteral("controller"));
+        result.insert("controller", controller);
+        result.insert("value", qBound(0, event.dataB(), 127));
+      } else {
+        return false;
+      }
+      break;
+    }
+    case Ms::ME_PROGRAM:
+      // Fluid's mobile adapter consumes program changes through the same
+      // internal controller representation used by MuseScore's channels.
+      result.insert("kind", QStringLiteral("controller"));
+      result.insert("controller", Ms::CTRL_PROGRAM);
+      result.insert("value", qBound(0, event.dataB(), 127));
+      break;
+    case Ms::ME_PITCHBEND:
+      result.insert("kind", QStringLiteral("pitchBend"));
+      result.insert("lsb", qBound(0, event.dataA(), 127));
+      result.insert("msb", qBound(0, event.dataB(), 127));
+      break;
+    case Ms::ME_AFTERTOUCH:
+      result.insert("kind", QStringLiteral("aftertouch"));
+      result.insert("value", qBound(0, event.dataA(), 127));
+      break;
+    case Ms::ME_POLYAFTER:
+      result.insert("kind", QStringLiteral("polyAfter"));
+      result.insert("pitch", qBound(0, event.dataA(), 127));
+      result.insert("value", qBound(0, event.dataB(), 127));
+      break;
+    default:
+      return false;
+  }
+
+  events->append(result);
+  return true;
+}
+
 QJsonObject open_with_musescore(const char* utf8_path) {
   if (!initialize_musescore()) return {};
 
@@ -683,6 +940,15 @@ QJsonObject open_with_musescore(const char* utf8_path) {
                   .arg(static_cast<int>(error)));
     return {};
   }
+
+  // Match the desktop readScore() bootstrap: expressive patch selection must
+  // happen before renderMidi() and before Channel::initList() is serialized.
+  // Without this step ordinary Violin/Violoncello channels stay on the plain
+  // bank even though MS Basic provides a dedicated expressive sample set.
+  score.rebuildMidiMapping();
+  score.updateChannel();
+  MuseReaderAudio::updateExpressive(&score);
+  score.rebuildMidiMapping();
 
   // A score file may persist MuseScore's view mode as
   // <layoutMode>line</layoutMode> or <layoutMode>system</layoutMode>.  Those
@@ -704,6 +970,9 @@ QJsonObject open_with_musescore(const char* utf8_path) {
   // Layout is the source of truth for every page image. No Flutter-side
   // geometry is used when this backend is enabled.
   score.doLayout();
+  if (repair_title_frame_text_collisions(&score)) {
+    score.doLayout();
+  }
   // Keep the original geometry for note anchors, then expand a second copy
   // onto the same unrolled tick axis used by renderMidi().
   // MasterScore exposes RepeatList through a const accessor; setting the
@@ -793,6 +1062,11 @@ QJsonObject open_with_musescore(const char* utf8_path) {
   score.rebuildMidiMapping();
   Ms::EventMap midi_events;
   score.renderMidi(&midi_events, false, true, Ms::defaultState);
+  const auto tick_to_time_us = [&score](int tick) -> qint64 {
+    const qreal seconds = score.utick2utime(tick);
+    if (!qIsFinite(seconds)) return 0;
+    return qMax<qint64>(0, qRound64(seconds * 1000000.0));
+  };
   // EventMap::fixupMIDI uses the same quantized tuning key when it keeps
   // overlapping voices apart.  Mirror that key here so note-offs for two
   // equal MIDI pitches with different cent offsets are paired correctly.
@@ -801,15 +1075,32 @@ QJsonObject open_with_musescore(const char* utf8_path) {
   // A note can occur more than once in the unrolled MIDI stream (repeats,
   // tied playback events).  Render its exact glyph once and reuse the PNG.
   std::map<const Ms::Note*, RenderedNotehead> notehead_cache;
+  std::map<const Ms::Note*, QJsonArray> highlight_rect_cache;
   std::map<int, int> programs;
   std::map<int, int> banks;
+  QJsonArray audio_events;
   for (const Ms::MidiMapping& mapping : score.midiMapping()) {
     const Ms::Channel* channel = mapping.articulation();
     if (!channel || channel->channel() < 0) continue;
-    programs[channel->channel()] =
+    const int channel_number =
+        qBound(0, channel->channel(), 255);
+    programs[channel_number] =
         qBound(0, channel->program(), 127);
-    banks[channel->channel()] =
+    banks[channel_number] =
         qBound(0, channel->bank(), 16383);
+    // renderMidi() does not include Channel::initList().  The original
+    // sequencer sends these events before the first note, so serialize them at
+    // time zero to select every mapped instrument and its mixer state.
+    for (const Ms::MidiCoreEvent& init_event : channel->initList()) {
+      // Channel::updateInitList() intentionally leaves the core event's
+      // channel at its default value; Seq::initInstruments() supplies the
+      // articulation channel when it wraps the event as NPlayEvent.
+      const Ms::NPlayEvent playback_event(
+          init_event.type(), static_cast<uchar>(channel_number),
+          static_cast<uchar>(init_event.dataA()),
+          static_cast<uchar>(init_event.dataB()));
+      append_audio_event(&audio_events, 0, playback_event);
+    }
   }
   QJsonArray events;
   int end_tick = score.repeatList().ticks();
@@ -820,6 +1111,7 @@ QJsonObject open_with_musescore(const char* utf8_path) {
     const int tick = item.first;
     const Ms::NPlayEvent& event = item.second;
     end_tick = qMax(end_tick, tick);
+    append_audio_event(&audio_events, tick_to_time_us(tick), event);
     if (event.type() == Ms::ME_CONTROLLER) {
       const int channel = event.channel();
       const int value = qBound(0, event.value(), 127);
@@ -861,6 +1153,7 @@ QJsonObject open_with_musescore(const char* utf8_path) {
       bool notehead_filled = true;
       int source_tick = -1;
       qint64 click_start_us = -1;
+      QJsonArray highlight_rects;
       if (event.note() && event.note()->chord() && event.note()->chord()->measure()) {
         Ms::Measure* measure = event.note()->chord()->measure();
         source_tick = event.note()->chord()->tick().ticks();
@@ -880,6 +1173,16 @@ QJsonObject open_with_musescore(const char* utf8_path) {
                           .translated(-note_page->abbox().topLeft())
                           .normalized();
           const Ms::Note* source_note = event.note();
+          const Ms::Note* first_tied_note = source_note->firstTiedNote();
+          auto cached_highlights = highlight_rect_cache.find(first_tied_note);
+          if (cached_highlights == highlight_rect_cache.end()) {
+            cached_highlights = highlight_rect_cache
+                                    .emplace(first_tied_note,
+                                             tied_highlight_rects(
+                                                 &score, first_tied_note))
+                                    .first;
+          }
+          highlight_rects = cached_highlights->second;
           auto cached_notehead = notehead_cache.find(source_note);
           if (cached_notehead == notehead_cache.end()) {
             cached_notehead =
@@ -927,7 +1230,8 @@ QJsonObject open_with_musescore(const char* utf8_path) {
            cursor_end_x,
            has_cursor,
            source_tick,
-           click_start_us});
+           click_start_us,
+           highlight_rects});
     } else if (event.type() == Ms::ME_NOTEOFF ||
                (event.type() == Ms::ME_NOTEON && event.velo() == 0)) {
       auto open = active.find(key);
@@ -945,6 +1249,7 @@ QJsonObject open_with_musescore(const char* utf8_path) {
     }
   }
   document.insert("events", events);
+  if (!audio_events.isEmpty()) document.insert("audioEvents", audio_events);
   document.insert("endTick", end_tick);
   document.insert("durationUs", qRound64(score.utick2utime(end_tick) * 1000000.0));
   return document;

@@ -1,4 +1,6 @@
 import 'dart:convert';
+import 'dart:io';
+import 'dart:isolate';
 
 import 'package:flutter/services.dart';
 
@@ -12,11 +14,22 @@ class MuseScoreBridge {
   MuseScoreBridge._();
 
   static const _channel = MethodChannel('com.musereader/musescore_engine');
+  static const _documentCacheVersion = 1;
+  static const _documentCacheSuffix = '.musereader-document-v1.json.gz';
   // MuseScore uses an unsigned-byte playback channel.  It may allocate more
   // than the sixteen wire-MIDI channels for articulation/instrument states.
   static const _maxPlaybackChannel = 255;
 
   static Future<ScoreDocument?> open(String path, {String? sourcePath}) async {
+    final cachedPayload = await _readDocumentCache(path);
+    if (cachedPayload != null) {
+      try {
+        return _documentFromMap(cachedPayload, sourcePath ?? path);
+      } on Object {
+        // A stale or partial cache falls through to the native renderer and is
+        // replaced after a successful open.
+      }
+    }
     try {
       final raw = await _channel.invokeMethod<Object?>('open', {'path': path});
       if (raw is! Map) return null;
@@ -28,11 +41,83 @@ class MuseScoreBridge {
           _asString(raw['error'], fallback: 'MuseScore 原生核心没有返回谱面文档。'),
         );
       }
-      return _documentFromMap(payload, sourcePath ?? path);
+      final document = _documentFromMap(payload, sourcePath ?? path);
+      await _writeDocumentCache(path, payload);
+      return document;
     } on MissingPluginException {
       return null;
     } on PlatformException catch (error) {
       throw MuseScoreBridgeException(error.message ?? 'MuseScore 原生通道调用失败。');
+    }
+  }
+
+  static Future<Map<dynamic, dynamic>?> _readDocumentCache(String path) async {
+    try {
+      final sourceStat = await File(path).stat();
+      if (sourceStat.type != FileSystemEntityType.file) return null;
+      final cachePath = '$path$_documentCacheSuffix';
+      if (!await File(cachePath).exists()) return null;
+      final decoded = await Isolate.run<Object?>(() async {
+        final compressed = await File(cachePath).readAsBytes();
+        final jsonBytes = gzip.decode(compressed);
+        return jsonDecode(utf8.decode(jsonBytes));
+      });
+      if (decoded is! Map ||
+          decoded['version'] != _documentCacheVersion ||
+          decoded['sourceLength'] != sourceStat.size ||
+          decoded['sourceModifiedUs'] !=
+              sourceStat.modified.microsecondsSinceEpoch) {
+        return null;
+      }
+      final document = decoded['document'];
+      return document is Map ? document : null;
+    } on Object {
+      return null;
+    }
+  }
+
+  static Future<void> _writeDocumentCache(
+    String path,
+    Map<dynamic, dynamic> payload,
+  ) async {
+    try {
+      final sourceStat = await File(path).stat();
+      if (sourceStat.type != FileSystemEntityType.file) return;
+      final cachePath = '$path$_documentCacheSuffix';
+      final sourceLength = sourceStat.size;
+      final sourceModifiedUs = sourceStat.modified.microsecondsSinceEpoch;
+      await Isolate.run(() async {
+        final wrapper = <String, Object>{
+          'version': _documentCacheVersion,
+          'sourceLength': sourceLength,
+          'sourceModifiedUs': sourceModifiedUs,
+          'document': payload,
+        };
+        final encoded = utf8.encode(
+          jsonEncode(
+            wrapper,
+            toEncodable: (value) {
+              if (value is Uint8List) return base64Encode(value);
+              if (value is ByteData) {
+                return base64Encode(
+                  value.buffer.asUint8List(
+                    value.offsetInBytes,
+                    value.lengthInBytes,
+                  ),
+                );
+              }
+              throw JsonUnsupportedObjectError(value);
+            },
+          ),
+        );
+        final temporary = File('$cachePath.tmp');
+        await temporary.writeAsBytes(gzip.encode(encoded), flush: true);
+        final target = File(cachePath);
+        if (await target.exists()) await target.delete();
+        await temporary.rename(cachePath);
+      });
+    } on Object {
+      // Rendering succeeded, so persistence is an optional optimization.
     }
   }
 
@@ -45,7 +130,7 @@ class MuseScoreBridge {
       await _channel.invokeMethod<void>('startAudio', {
         'positionUs': positionUs,
         'speed': speed,
-        'events': document.nativeEvents,
+        'events': document.nativeAudioEvents,
       });
     } on MissingPluginException {
       // A compatibility build can still show deterministic progress.
@@ -64,12 +149,13 @@ class MuseScoreBridge {
     }
   }
 
-  /// Returns the Android audio sink's current presentation position.
+  /// Returns the mobile audio sink's current presentation position.
   ///
   /// Audio output is allowed to have a device/AVD buffer, so a wall-clock
   /// estimate on the Flutter side can run ahead of what is audible. Platforms
-  /// without this optional method return `null`, preserving the deterministic
-  /// local-clock fallback used by tests and desktop builds.
+  /// Android uses AudioTrack timestamps and iOS accounts for AVAudioEngine's
+  /// presentation latency. Platforms without this optional method return
+  /// `null`, preserving the local-clock fallback used by tests and desktop.
   static Future<int?> audioPositionUs() async {
     try {
       final raw = await _channel.invokeMethod<Object?>('audioPositionUs');
@@ -159,6 +245,9 @@ class MuseScoreBridge {
               bank: _asInt(raw['bank']).clamp(0, 16383).toInt(),
               pageIndex: _asIntOrNull(raw['page']),
               pageRect: _scoreRectOrNull(raw['rect']),
+              highlights: _scorePlaybackHighlights(
+                raw['highlightRects'] ?? raw['highlights'],
+              ),
               noteheadImageBytes: _bytesOrNull(
                 raw['noteheadImage'] ?? raw['noteHeadImage'],
               ),
@@ -181,6 +270,25 @@ class MuseScoreBridge {
       if (tickOrder != 0) return tickOrder;
       return a.pitch.compareTo(b.pitch);
     });
+
+    final audioEvents = <Map<String, Object>>[];
+    final rawAudioEvents = map['audioEvents'];
+    if (rawAudioEvents is Iterable) {
+      for (final raw in rawAudioEvents) {
+        if (raw is! Map) continue;
+        final normalized = <String, Object>{};
+        for (final entry in raw.entries) {
+          final key = entry.key;
+          final value = entry.value;
+          if (key is String && value != null) {
+            normalized[key] = value;
+          }
+        }
+        if (normalized.isNotEmpty) {
+          audioEvents.add(Map.unmodifiable(normalized));
+        }
+      }
+    }
 
     final pages = <ScorePage>[];
     final rawPages = map['pages'];
@@ -274,6 +382,7 @@ class MuseScoreBridge {
       symbolFont: symbolFont.isEmpty ? null : symbolFont,
       renderDpi: _asPositiveIntOrNull(map['renderDpi']),
       cursorSegments: List.unmodifiable(cursorSegments),
+      audioEvents: List.unmodifiable(audioEvents),
     );
   }
 
@@ -319,6 +428,19 @@ class MuseScoreBridge {
       sourceTick: sourceTick,
       clickStartUs: _asIntOrNull(raw['clickStartUs']),
     );
+  }
+
+  static List<ScorePlaybackHighlight> _scorePlaybackHighlights(dynamic value) {
+    if (value is! Iterable) return const [];
+    final highlights = <ScorePlaybackHighlight>[];
+    for (final raw in value) {
+      if (raw is! Map) continue;
+      final pageIndex = _asIntOrNull(raw['page'] ?? raw['pageIndex']);
+      final rect = _scoreRectOrNull(raw['rect'] ?? raw);
+      if (pageIndex == null || pageIndex < 0 || rect == null) continue;
+      highlights.add(ScorePlaybackHighlight(pageIndex: pageIndex, rect: rect));
+    }
+    return List.unmodifiable(highlights);
   }
 
   static ScoreCursorSegment? _cursorSegmentFromMap(Map<dynamic, dynamic> raw) {

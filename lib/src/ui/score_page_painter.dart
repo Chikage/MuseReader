@@ -4,6 +4,8 @@ import '../model/score_document.dart';
 
 /// MuseScore 3.6.2's first voice/playback selection colour.
 const museScorePlaybackColor = Color(0xff0065bf);
+const museScoreInkColor = Color(0xff20211f);
+const museScorePaperColor = Color(0xfffdfbf7);
 
 class ScorePagePainter extends CustomPainter {
   const ScorePagePainter({
@@ -27,7 +29,7 @@ class ScorePagePainter extends CustomPainter {
     canvas.save();
     canvas.scale(scaleX, scaleY);
 
-    final paper = Paint()..color = const Color(0xfffdfbf7);
+    final paper = Paint()..color = museScorePaperColor;
     canvas.drawRect(Offset.zero & Size(page.width, page.height), paper);
     final border = Paint()
       ..color = const Color(0xffe4ded4)

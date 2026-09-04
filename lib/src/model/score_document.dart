@@ -30,6 +30,18 @@ class ScoreRect {
       left.isFinite && top.isFinite && width.isFinite && height.isFinite;
 }
 
+/// One page-local region whose engraved ink follows a playback event's color.
+///
+/// Native MuseScore events can span a chain of tied notes, including ties that
+/// cross systems or pages. Keeping the page with each region lets the reader
+/// recolor the complete chain while the single MIDI event remains active.
+class ScorePlaybackHighlight {
+  const ScorePlaybackHighlight({required this.pageIndex, required this.rect});
+
+  final int pageIndex;
+  final ScoreRect rect;
+}
+
 /// One interval of the playback cursor on an engraved page.
 ///
 /// MuseScore positions its playback cursor by interpolating between the
@@ -325,6 +337,7 @@ class PlaybackEvent {
     this.pageIndex,
     this.glyphIndex,
     this.pageRect,
+    this.highlights = const [],
     this.noteheadImageBytes,
     this.noteheadRect,
     this.cursorRect,
@@ -373,6 +386,11 @@ class PlaybackEvent {
   final int? glyphIndex;
   final ScoreRect? pageRect;
 
+  /// Page-local notehead and tie regions that should be recolored together.
+  /// Empty lists retain compatibility with payloads that only carry
+  /// [pageIndex] and [pageRect].
+  final List<ScorePlaybackHighlight> highlights;
+
   /// Legacy MuseScore-rendered notehead pixels for playback highlighting.
   ///
   /// Older readers used this transparent bitmap as a second layer over the
@@ -411,6 +429,7 @@ class PlaybackEvent {
     int? pageIndex,
     int? glyphIndex,
     ScoreRect? pageRect,
+    List<ScorePlaybackHighlight>? highlights,
     Uint8List? noteheadImageBytes,
     ScoreRect? noteheadRect,
     ScoreRect? cursorRect,
@@ -437,6 +456,7 @@ class PlaybackEvent {
     pageIndex: pageIndex ?? this.pageIndex,
     glyphIndex: glyphIndex ?? this.glyphIndex,
     pageRect: pageRect ?? this.pageRect,
+    highlights: highlights ?? this.highlights,
     noteheadImageBytes: noteheadImageBytes ?? this.noteheadImageBytes,
     noteheadRect: noteheadRect ?? this.noteheadRect,
     cursorRect: cursorRect ?? this.cursorRect,
@@ -488,6 +508,7 @@ class ScoreDocument {
     this.symbolFont,
     this.renderDpi,
     this.cursorSegments = const [],
+    this.audioEvents = const [],
   });
 
   final String sourcePath;
@@ -506,6 +527,11 @@ class ScoreDocument {
   final String? symbolFont;
   final int? renderDpi;
   final List<ScoreCursorSegment> cursorSegments;
+
+  /// Non-note MIDI actions used by the native SoundFont renderer. These are
+  /// kept separate from [events] because the latter drives page interaction
+  /// and intentionally contains notes only.
+  final List<Map<String, Object>> audioEvents;
 
   int get durationUs =>
       durationUsOverride ??
@@ -947,4 +973,49 @@ class ScoreDocument {
 
   List<Map<String, Object>> get nativeEvents =>
       events.map((event) => event.toMap(tempoMap)).toList(growable: false);
+
+  /// Return the complete event stream expected by the native audio backend.
+  ///
+  /// Older documents have no controller stream, so they retain the exact
+  /// note-only payload that previous platform binaries consumed. Native
+  /// controller actions are sorted against note starts so initialization and
+  /// expressive controls are applied before a note at the same timestamp.
+  List<Map<String, Object>> get nativeAudioEvents {
+    final notes = nativeEvents;
+    if (audioEvents.isEmpty) return notes;
+
+    final combined = <Map<String, Object>>[...audioEvents, ...notes];
+    final indexed = combined.asMap().entries.toList(growable: false);
+    indexed.sort((left, right) {
+      final leftTime = _nativeAudioEventTime(left.value);
+      final rightTime = _nativeAudioEventTime(right.value);
+      final timeOrder = leftTime.compareTo(rightTime);
+      if (timeOrder != 0) return timeOrder;
+      final leftControl = _isNativeAudioControl(left.value);
+      final rightControl = _isNativeAudioControl(right.value);
+      if (leftControl != rightControl) return leftControl ? -1 : 1;
+      return left.key.compareTo(right.key);
+    });
+    return List.unmodifiable(indexed.map((entry) => entry.value));
+  }
+
+  static int _nativeAudioEventTime(Map<String, Object> event) {
+    final raw = event['timeUs'] ?? event['startUs'];
+    if (raw is num && raw.isFinite) {
+      final value = raw.round();
+      return value < 0 ? 0 : value;
+    }
+    if (raw is String) {
+      final parsed = int.tryParse(raw);
+      if (parsed != null) return parsed < 0 ? 0 : parsed;
+    }
+    return 0;
+  }
+
+  static bool _isNativeAudioControl(Map<String, Object> event) =>
+      event['kind'] != null ||
+      event['type'] != null ||
+      event.containsKey('controller') ||
+      event.containsKey('cc') ||
+      event.containsKey('ctrl');
 }

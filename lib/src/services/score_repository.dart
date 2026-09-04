@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
 import '../model/score_document.dart';
@@ -67,6 +68,10 @@ class ScoreRepository {
     );
     await directory.create(recursive: true);
     final file = File('${directory.path}/$fileName');
+    if (await file.exists() && await file.length() == bytes.length) {
+      final existing = await file.readAsBytes();
+      if (listEquals(existing, bytes)) return file.path;
+    }
     await file.writeAsBytes(bytes, flush: true);
     return file.path;
   }

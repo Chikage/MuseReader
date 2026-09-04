@@ -83,9 +83,9 @@ class PlaybackController extends ChangeNotifier {
     }
     final generation = ++_playbackGeneration;
     _basePositionUs = _positionUs;
-    // Keep the clock stopped until Android has created and primed its
-    // AudioTrack.  Starting it before the first PCM block is presented makes
-    // the blue cursor run ahead by the AVD/device output latency.
+    // Keep the fallback clock stopped until the platform has created and
+    // primed its audio route. Starting it before the first PCM block is
+    // presented makes the cursor run ahead by the output latency.
     _clock = null;
     _audioPositionUs = null;
     _isPlaying = true;
@@ -200,9 +200,9 @@ class PlaybackController extends ChangeNotifier {
       final reported = await MuseScoreBridge.audioPositionUs();
       if (!_isPlaying || generation != _playbackGeneration) return;
 
-      // A missing track means the optional Android clock is unavailable (or
-      // has just finished). Rebase the local fallback at the last reported
-      // audio position so a temporary query gap cannot introduce a jump.
+      // A missing track means the platform clock is unavailable (or has just
+      // finished). Rebase the local fallback at the last reported position so
+      // a temporary query gap cannot introduce a jump.
       if (reported == null && _audioPositionUs != null) {
         _positionUs = _audioPositionUs!.clamp(0, durationUs).toInt();
         _basePositionUs = _positionUs;

@@ -1,6 +1,7 @@
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:muse_reader/main.dart';
 import 'package:muse_reader/src/model/score_document.dart';
@@ -10,6 +11,11 @@ void main() {
   testWidgets('opens the bundled score without a compact-layout overflow', (
     tester,
   ) async {
+    const filesChannel = MethodChannel('com.musereader/files');
+    final messenger =
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+    messenger.setMockMethodCallHandler(filesChannel, (call) async => const []);
+    addTearDown(() => messenger.setMockMethodCallHandler(filesChannel, null));
     tester.view.physicalSize = const Size(390, 844);
     tester.view.devicePixelRatio = 1;
     addTearDown(() {
@@ -70,6 +76,20 @@ void main() {
           measure: 1,
           pageIndex: 0,
           pageRect: ScoreRect(180, 260, 18, 20),
+          highlights: [
+            ScorePlaybackHighlight(
+              pageIndex: 0,
+              rect: ScoreRect(180, 260, 18, 20),
+            ),
+            ScorePlaybackHighlight(
+              pageIndex: 0,
+              rect: ScoreRect(198, 250, 132, 8),
+            ),
+            ScorePlaybackHighlight(
+              pageIndex: 0,
+              rect: ScoreRect(330, 260, 18, 20),
+            ),
+          ],
         ),
       ],
       pages: [
@@ -93,6 +113,23 @@ void main() {
 
     expect(find.text('Native fixture'), findsOneWidget);
     expect(find.byType(InteractiveViewer), findsOneWidget);
+
+    await tester.tap(find.byTooltip('播放'));
+    await tester.pump();
+
+    final clipFinder = find.descendant(
+      of: find.byKey(const ValueKey('score-page-0')),
+      matching: find.byType(ClipPath),
+    );
+    expect(clipFinder, findsOneWidget);
+    final clip = tester.widget<ClipPath>(clipFinder);
+    final clipSize = tester.getSize(clipFinder);
+    final highlightPath = clip.clipper!.getClip(clipSize);
+    Offset pagePoint(double x, double y) =>
+        Offset(x * clipSize.width / 820, y * clipSize.height / 1160);
+    expect(highlightPath.contains(pagePoint(189, 270)), isTrue);
+    expect(highlightPath.contains(pagePoint(264, 254)), isTrue);
+    expect(highlightPath.contains(pagePoint(339, 270)), isTrue);
     expect(tester.takeException(), isNull);
   });
 

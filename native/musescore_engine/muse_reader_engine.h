@@ -44,8 +44,10 @@ MUSE_READER_EXPORT int muse_reader_audio_is_available(void);
 MUSE_READER_EXPORT int muse_reader_audio_initialize(void);
 
 /**
- * Starts rendering a JSON array of note events. The JSON shape is the same
- * event list returned by muse_reader_open_json().
+ * Starts rendering a JSON array of playback events. The array may contain the
+ * note maps returned in the document's `events` field plus typed MIDI control
+ * maps from `audioEvents` (program/bank initialization, controllers, pitch
+ * bends, and aftertouch).
  */
 MUSE_READER_EXPORT int muse_reader_audio_start_json(
     const char* events_json,

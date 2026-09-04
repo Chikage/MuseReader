@@ -47,9 +47,9 @@ product build. The CMake resource file embeds the MuseScore 3.6.2 default
 copied into the Flutter asset bundle a second time. SF3 Ogg
 packets are decoded in memory by the bundled `stb_vorbis` implementation.
 
-`muse_reader_audio.cpp` converts the native note-event JSON (including each
-note's cent offset) into FluidSynth program/note events and exposes a small
-pull-render API in
+`muse_reader_audio.cpp` converts the native note and MIDI-control event JSON
+(including each note's cent offset) into the same program, controller, and
+note events used by MuseScore's sequencer, then exposes a small pull-render API in
 `muse_reader_engine.h`. Android feeds that API to a stereo `AudioTrack`, while
 iOS feeds it to an `AVAudioSourceNode`. Both platforms retain the existing
 simple oscillator as a fallback for development builds whose native library

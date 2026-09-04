@@ -41,10 +41,10 @@ class _ReaderPageState extends State<ReaderPage> {
     if (cursor != null && _playback.cursorVisible) {
       _scoreViewportKey.currentState?.followCursor(
         cursor,
-        animate: _playback.isPlaying,
+        animate: _playback.isPlaying && !_reduceMotion,
       );
     } else if (pageChanged && _playback.cursorVisible) {
-      _scoreViewportKey.currentState?.focusPage(page);
+      _scoreViewportKey.currentState?.focusPage(page, animate: !_reduceMotion);
     }
     setState(() {});
   }
@@ -59,10 +59,13 @@ class _ReaderPageState extends State<ReaderPage> {
     if (widget.document.pages.isEmpty) return;
     final next = page.clamp(0, widget.document.pages.length - 1).toInt();
     _visiblePage = next;
-    _scoreViewportKey.currentState?.focusPage(next);
+    _scoreViewportKey.currentState?.focusPage(next, animate: !_reduceMotion);
     if (!mounted) return;
     setState(() {});
   }
+
+  bool get _reduceMotion =>
+      MediaQuery.maybeOf(context)?.disableAnimations ?? false;
 
   /// Mirror MuseScore's PLAY-state mouse handling.  The native score view
   /// resolves the nearby note, promotes it to its parent chord, and seeks the
@@ -99,40 +102,22 @@ class _ReaderPageState extends State<ReaderPage> {
           widget.document.title,
           maxLines: 1,
           overflow: TextOverflow.ellipsis,
+          style: theme.textTheme.titleMedium,
         ),
         actions: [
-          Tooltip(
-            message: '多页视图 · 双指缩放',
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 4),
-              child: Icon(
-                Icons.view_quilt_outlined,
-                color: theme.colorScheme.primary,
-              ),
-            ),
-          ),
           IconButton(
             onPressed: () => _scoreViewportKey.currentState?.resetView(),
             icon: const Icon(Icons.fit_screen_outlined),
             tooltip: '适应页面',
           ),
-          Tooltip(
-            message: '只读阅读',
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16),
-              child: Icon(
-                Icons.visibility_outlined,
-                color: theme.colorScheme.primary,
-              ),
-            ),
-          ),
+          const SizedBox(width: 8),
         ],
       ),
       body: Column(
         children: [
           Expanded(
             child: ColoredBox(
-              color: theme.colorScheme.surfaceContainerLowest,
+              color: theme.colorScheme.surfaceContainerHigh,
               child: _MultiPageScoreViewport(
                 key: _scoreViewportKey,
                 document: widget.document,
@@ -543,11 +528,27 @@ class _MultiPageScoreViewportState extends State<_MultiPageScoreViewport>
         continue;
       }
       final event = widget.document.events[eventIndex];
+      for (final highlight in event.highlights) {
+        if (_pageIndexMatches(highlight.pageIndex, pageIndex)) {
+          _addUniqueRect(rects, highlight.rect);
+        }
+      }
       if (!_eventBelongsToPage(event, pageIndex)) continue;
       final rect = _usableNoteRect(event);
-      if (rect != null) rects.add(rect);
+      if (rect != null) _addUniqueRect(rects, rect);
     }
     return rects;
+  }
+
+  void _addUniqueRect(List<ScoreRect> rects, ScoreRect candidate) {
+    final duplicate = rects.any(
+      (rect) =>
+          rect.left == candidate.left &&
+          rect.top == candidate.top &&
+          rect.width == candidate.width &&
+          rect.height == candidate.height,
+    );
+    if (!duplicate) rects.add(candidate);
   }
 
   List<PlaybackEvent> _activeNotes(int pageIndex) {
@@ -574,13 +575,16 @@ class _MultiPageScoreViewportState extends State<_MultiPageScoreViewport>
   }
 
   bool _eventBelongsToPage(PlaybackEvent event, int pagePosition) {
-    final eventPage = event.pageIndex;
-    if (eventPage == null) return pagePosition == 0;
-    if (eventPage == pagePosition) return true;
+    return _pageIndexMatches(event.pageIndex, pagePosition);
+  }
+
+  bool _pageIndexMatches(int? sourcePage, int pagePosition) {
+    if (sourcePage == null) return pagePosition == 0;
+    if (sourcePage == pagePosition) return true;
     if (pagePosition < 0 || pagePosition >= widget.document.pages.length) {
       return false;
     }
-    return eventPage == widget.document.pages[pagePosition].index;
+    return sourcePage == widget.document.pages[pagePosition].index;
   }
 }
 
@@ -607,7 +611,6 @@ class _PageViewport extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
     final safePageWidth = page.width <= 0 ? 1.0 : page.width;
     final height = math.max(1.0, width * page.height / safePageWidth);
     final content = page.imageBytes != null
@@ -624,7 +627,7 @@ class _PageViewport extends StatelessWidget {
             painter: ScorePagePainter(
               page: page,
               activeEventIndexes: activeEventIndexes,
-              inkColor: theme.colorScheme.onSurface,
+              inkColor: museScoreInkColor,
               accentColor: museScorePlaybackColor,
               playbackCursor: playbackCursor,
             ),
@@ -655,7 +658,7 @@ class _PageViewport extends StatelessWidget {
               },
         child: Material(
           elevation: 3,
-          color: Colors.white,
+          color: museScorePaperColor,
           child: SizedBox(width: width, height: height, child: content),
         ),
       ),
@@ -690,17 +693,7 @@ class _NativePageStack extends StatelessWidget {
     final recoloredRects = <Rect>[];
     final fallbackNotes = <PlaybackEvent>[];
     final fallbackRects = <ScoreRect>[];
-    for (final note in activeNotes) {
-      // The native bridge supplies the note's tight page rectangle.  Repaint
-      // the *existing page pixels* in that rectangle with a colour filter rather
-      // than placing a second notehead bitmap over the rasterized page.  The
-      // latter leaves the original antialiased black edge underneath and
-      // makes the playback mark look like a doubled note.
-      // pageRect is MuseScore's actual Note::bbox and is tighter than the
-      // padded legacy noteheadRect (the latter was sized for a transparent
-      // bitmap's antialiasing margin).  Prefer the tight rectangle so nearby
-      // staff/ledger pixels are not recoloured along with the note.
-      final sourceRect = _usableNoteRect(note);
+    bool addRecoloredRect(ScoreRect? sourceRect) {
       final scaled = sourceRect == null
           ? null
           : Rect.fromLTWH(
@@ -716,8 +709,23 @@ class _NativePageStack extends StatelessWidget {
           clipped.isFinite &&
           clipped.width > 0 &&
           clipped.height > 0) {
-        recoloredRects.add(clipped);
-      } else {
+        if (!recoloredRects.contains(clipped)) recoloredRects.add(clipped);
+        return true;
+      }
+      return false;
+    }
+
+    // Repaint the existing page pixels inside every native highlight region.
+    // A tied playback event contributes all noteheads plus narrow regions that
+    // trace each tie segment, including segments on another system or page.
+    for (final rect in activePageRects) {
+      addRecoloredRect(rect);
+    }
+    for (final note in activeNotes) {
+      // Legacy payloads only expose a single note rectangle. Keep their
+      // geometric painter as a last-resort compatibility path when that
+      // rectangle cannot be filtered in place.
+      if (!addRecoloredRect(_usableNoteRect(note))) {
         // Keep the geometric painter as a last-resort compatibility path for
         // old/partial native payloads that do not contain usable geometry.
         fallbackNotes.add(note);
@@ -775,7 +783,7 @@ class _NativePageStack extends StatelessWidget {
               painter: _PlaybackOverlayPainter(
                 pageWidth: page.width,
                 pageHeight: page.height,
-                rects: activeNotes.isEmpty ? activePageRects : fallbackRects,
+                rects: fallbackRects,
                 notes: fallbackNotes,
                 cursor: playbackCursor,
                 color: museScorePlaybackColor,
@@ -833,9 +841,9 @@ const _playbackNoteColorFilter = ColorFilter.matrix(<double>[
   0,
 ]);
 
-/// Clips the filtered page copy to the union of all currently sounding
-/// notehead rectangles. Keeping this as one clip/filter pair avoids creating a
-/// widget and a separate composited layer for every note in a chord.
+/// Clips the filtered page copy to the union of all currently active notehead
+/// and tie regions. Keeping this as one clip/filter pair avoids creating a
+/// widget and a separate composited layer for every small region.
 class _NoteRectsClipper extends CustomClipper<Path> {
   const _NoteRectsClipper(this.rects);
 
@@ -985,144 +993,197 @@ class _TransportBar extends StatelessWidget {
     final theme = Theme.of(context);
     return Material(
       color: theme.colorScheme.surface,
-      elevation: 5,
-      child: SafeArea(
-        top: false,
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(16, 8, 16, 10),
-          child: AnimatedBuilder(
-            animation: playback,
-            builder: (context, _) {
-              final progress = playback.progress.clamp(0.0, 1.0).toDouble();
-              return LayoutBuilder(
-                builder: (context, constraints) {
-                  // The inline timeline needs a little more room than the
-                  // previous two-row transport layout.  Keep the auxiliary
-                  // controls on their own row until the primary controls can
-                  // offer the scrubber a comfortable hit target.
-                  final compact = constraints.maxWidth < 700;
-                  // Padding leaves roughly 32 px less than the device width;
-                  // reserve the stacked variant for genuinely narrow phones.
-                  final ultraCompact = constraints.maxWidth < 320;
-                  final timeline = Slider(
-                    value: progress,
-                    onChanged: playback.durationUs == 0
-                        ? null
-                        : (value) => playback.seekToUs(
-                            (value * playback.durationUs).round(),
-                          ),
-                  );
-                  final playbackTime = Text(
-                    '${formatScoreDuration(playback.positionUs)}/${formatScoreDuration(playback.durationUs)}',
-                    style: theme.textTheme.labelMedium?.copyWith(
-                      fontFeatures: const [FontFeature.tabularFigures()],
-                    ),
-                  );
-                  final restartButton = IconButton(
-                    onPressed: playback.restart,
-                    icon: const Icon(Icons.restart_alt),
-                    tooltip: '从头开始',
-                  );
-                  final playButton = Tooltip(
-                    message: playback.isPlaying ? '暂停' : '播放',
-                    child: FilledButton(
-                      onPressed: playback.toggle,
-                      style: FilledButton.styleFrom(
-                        shape: const CircleBorder(),
-                        padding: const EdgeInsets.all(14),
-                        minimumSize: const Size(52, 52),
-                      ),
-                      child: Icon(
-                        playback.isPlaying ? Icons.pause : Icons.play_arrow,
-                        size: 25,
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          border: Border(
+            top: BorderSide(color: theme.colorScheme.outlineVariant),
+          ),
+        ),
+        child: SafeArea(
+          top: false,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 10),
+            child: AnimatedBuilder(
+              animation: playback,
+              builder: (context, _) {
+                final progress = playback.progress.clamp(0.0, 1.0).toDouble();
+                final currentTime = formatScoreDuration(playback.positionUs);
+                final totalTime = formatScoreDuration(playback.durationUs);
+                final timeline = Slider(
+                  value: progress,
+                  onChanged: playback.durationUs == 0
+                      ? null
+                      : (value) => playback.seekToUs(
+                          (value * playback.durationUs).round(),
+                        ),
+                  semanticFormatterCallback: (value) =>
+                      '${formatScoreDuration((value * playback.durationUs).round())}，共 $totalTime',
+                );
+                final playbackTime = Semantics(
+                  label: '已播放 $currentTime，共 $totalTime',
+                  child: ExcludeSemantics(
+                    child: Text(
+                      '$currentTime/$totalTime',
+                      maxLines: 1,
+                      style: theme.textTheme.labelMedium?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
+                        fontFeatures: const [FontFeature.tabularFigures()],
                       ),
                     ),
-                  );
-                  final primary = ultraCompact
-                      ? Column(
-                          mainAxisSize: MainAxisSize.min,
+                  ),
+                );
+                final restartButton = IconButton(
+                  onPressed: playback.restart,
+                  icon: const Icon(Icons.restart_alt_rounded),
+                  color: theme.colorScheme.onSurfaceVariant,
+                  tooltip: '从头开始',
+                );
+                final playButton = Semantics(
+                  toggled: playback.isPlaying,
+                  child: IconButton.filled(
+                    onPressed: playback.toggle,
+                    icon: Icon(
+                      playback.isPlaying
+                          ? Icons.pause_rounded
+                          : Icons.play_arrow_rounded,
+                      size: 28,
+                    ),
+                    tooltip: playback.isPlaying ? '暂停' : '播放',
+                    style: IconButton.styleFrom(
+                      minimumSize: const Size.square(56),
+                      maximumSize: const Size.square(56),
+                      backgroundColor: theme.colorScheme.primary,
+                      foregroundColor: theme.colorScheme.onPrimary,
+                    ),
+                  ),
+                );
+                final pageControls = _PageNavigator(
+                  page: page,
+                  pageCount: pageCount,
+                  onPageChanged: onPageChanged,
+                );
+                return LayoutBuilder(
+                  builder: (context, constraints) {
+                    final textScale =
+                        MediaQuery.textScalerOf(context).scale(14) / 14;
+                    final wide =
+                        constraints.maxWidth >= 700 && textScale <= 1.4;
+                    if (wide) {
+                      return Row(
+                        children: [
+                          restartButton,
+                          const SizedBox(width: 8),
+                          playButton,
+                          const SizedBox(width: 16),
+                          playbackTime,
+                          const SizedBox(width: 8),
+                          Expanded(child: timeline),
+                          const SizedBox(width: 16),
+                          pageControls,
+                        ],
+                      );
+                    }
+
+                    final narrow =
+                        constraints.maxWidth < 300 || textScale > 1.8;
+                    return Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Row(
                           children: [
-                            Row(
-                              children: [
-                                restartButton,
-                                playButton,
-                                const SizedBox(width: 8),
-                                // Keep the scrubber immediately after the
-                                // play button even at the narrowest width.
-                                Expanded(child: timeline),
-                              ],
-                            ),
-                            playbackTime,
-                          ],
-                        )
-                      : Row(
-                          children: [
-                            playbackTime,
-                            const SizedBox(width: 8),
-                            restartButton,
-                            playButton,
-                            const SizedBox(width: 8),
-                            // Keep the scrubber immediately after the play
-                            // button so it remains the primary playback
-                            // control on all sizes.
                             Expanded(child: timeline),
+                            const SizedBox(width: 8),
+                            playbackTime,
                           ],
-                        );
-                  final pageControlsContent = Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      IconButton(
-                        onPressed: page > 0
-                            ? () => onPageChanged(page - 1)
-                            : null,
-                        icon: const Icon(Icons.chevron_left),
-                        tooltip: '上一页',
-                      ),
-                      Text('${page + 1}/$pageCount'),
-                      IconButton(
-                        onPressed: page + 1 < pageCount
-                            ? () => onPageChanged(page + 1)
-                            : null,
-                        icon: const Icon(Icons.chevron_right),
-                        tooltip: '下一页',
-                      ),
-                    ],
-                  );
-                  final pageControls = ultraCompact
-                      ? SizedBox(
-                          width: constraints.maxWidth,
-                          child: FittedBox(
-                            fit: BoxFit.scaleDown,
-                            child: pageControlsContent,
+                        ),
+                        const SizedBox(height: 2),
+                        if (narrow) ...[
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              restartButton,
+                              const SizedBox(width: 8),
+                              playButton,
+                            ],
                           ),
-                        )
-                      : pageControlsContent;
-                  return Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      if (compact) ...[
-                        primary,
-                        if (ultraCompact) ...[
+                          const SizedBox(height: 4),
                           pageControls,
                         ] else
                           Row(
-                            mainAxisAlignment: MainAxisAlignment.end,
-                            children: [pageControls],
+                            children: [
+                              restartButton,
+                              const SizedBox(width: 8),
+                              playButton,
+                              const Spacer(),
+                              pageControls,
+                            ],
                           ),
-                      ] else
-                        Row(
-                          children: [
-                            Expanded(child: primary),
-                            pageControls,
-                          ],
-                        ),
-                    ],
-                  );
-                },
-              );
-            },
+                      ],
+                    );
+                  },
+                );
+              },
+            ),
           ),
         ),
+      ),
+    );
+  }
+}
+
+class _PageNavigator extends StatelessWidget {
+  const _PageNavigator({
+    required this.page,
+    required this.pageCount,
+    required this.onPageChanged,
+  });
+
+  final int page;
+  final int pageCount;
+  final Future<void> Function(int page) onPageChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final safePageCount = math.max(1, pageCount);
+    final safePage = page.clamp(0, safePageCount - 1).toInt();
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerLow,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: theme.colorScheme.outlineVariant),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          IconButton(
+            onPressed: safePage > 0 ? () => onPageChanged(safePage - 1) : null,
+            icon: const Icon(Icons.chevron_left_rounded),
+            tooltip: '上一页',
+          ),
+          Semantics(
+            label: '第 ${safePage + 1} 页，共 $safePageCount 页',
+            child: ExcludeSemantics(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 4),
+                child: Text(
+                  '${safePage + 1}/$safePageCount',
+                  maxLines: 1,
+                  style: theme.textTheme.labelLarge?.copyWith(
+                    fontFeatures: const [FontFeature.tabularFigures()],
+                  ),
+                ),
+              ),
+            ),
+          ),
+          IconButton(
+            onPressed: safePage + 1 < pageCount
+                ? () => onPageChanged(safePage + 1)
+                : null,
+            icon: const Icon(Icons.chevron_right_rounded),
+            tooltip: '下一页',
+          ),
+        ],
       ),
     );
   }

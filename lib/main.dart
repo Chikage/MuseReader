@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import 'src/ui/app_theme.dart';
 import 'src/ui/library_page.dart';
 
 void main() {
@@ -12,36 +13,12 @@ class MuseReaderApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    const primary = Color(0xffb54d35);
-    const secondary = Color(0xff2f7067);
     return MaterialApp(
       title: 'MuseReader',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        useMaterial3: true,
-        colorScheme:
-            ColorScheme.fromSeed(
-              seedColor: primary,
-              brightness: Brightness.light,
-            ).copyWith(
-              primary: primary,
-              secondary: secondary,
-              surface: const Color(0xfff8f6f1),
-            ),
-        scaffoldBackgroundColor: const Color(0xfff8f6f1),
-        appBarTheme: const AppBarTheme(
-          backgroundColor: Color(0xfff8f6f1),
-          surfaceTintColor: Colors.transparent,
-          elevation: 0,
-        ),
-        cardTheme: const CardThemeData(
-          color: Color(0xffffffff),
-          surfaceTintColor: Colors.transparent,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.all(Radius.circular(8)),
-          ),
-        ),
-      ),
+      theme: MuseReaderTheme.light,
+      darkTheme: MuseReaderTheme.dark,
+      themeMode: ThemeMode.system,
       home: const LibraryPage(),
     );
   }

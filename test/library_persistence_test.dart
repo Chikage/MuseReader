@@ -1,3 +1,6 @@
+import 'dart:io';
+
+import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:muse_reader/main.dart';
@@ -15,17 +18,30 @@ void main() {
     messenger.setMockMethodCallHandler(engineChannel, null);
   });
 
-  testWidgets('restores persisted imports when the library starts', (
+  testWidgets('restores persisted imports without opening them at startup', (
     tester,
   ) async {
+    final directory = await tester.runAsync(() async {
+      final temporary = await Directory.systemTemp.createTemp(
+        'muse_reader_library_widget_test.',
+      );
+      await File(
+        '${temporary.path}/persisted.mscx',
+      ).writeAsString('<museScore/>', flush: true);
+      return temporary;
+    });
+    addTearDown(() => directory!.delete(recursive: true));
+    final sourcePath = '${directory!.path}/persisted.mscx';
     var listed = false;
+    var openCalls = 0;
     messenger.setMockMethodCallHandler(filesChannel, (call) async {
       expect(call.method, 'listImportedScoreFiles');
       listed = true;
-      return ['/data/user/0/icu.ringona.musereader/files/persisted.mscx'];
+      return [sourcePath];
     });
     messenger.setMockMethodCallHandler(engineChannel, (call) async {
       expect(call.method, 'open');
+      openCalls++;
       return {
         'available': true,
         'document': {
@@ -52,6 +68,26 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(listed, isTrue);
+    expect(openCalls, 0);
+    expect(find.text('persisted'), findsOneWidget);
+
+    final scoreCard = find.ancestor(
+      of: find.text('persisted'),
+      matching: find.byType(InkWell),
+    );
+    expect(scoreCard, findsOneWidget);
+    final onOpen = tester.widget<InkWell>(scoreCard).onTap!;
+    await tester.runAsync(() async {
+      onOpen();
+      final deadline = DateTime.now().add(const Duration(seconds: 2));
+      while (openCalls == 0 && DateTime.now().isBefore(deadline)) {
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+    });
+    await tester.pump(const Duration(milliseconds: 300));
+
+    expect(openCalls, 1);
     expect(find.text('Persisted score'), findsOneWidget);
   });
 
