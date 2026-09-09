@@ -1,10 +1,12 @@
 package icu.ringona.musereader
 
 import android.app.Activity
+import android.content.Context
 import android.content.Intent
 import android.database.Cursor
 import android.net.Uri
 import android.os.Bundle
+import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import android.util.Log
 import io.flutter.embedding.android.FlutterActivity
@@ -20,11 +22,15 @@ class MainActivity : FlutterActivity() {
         private const val FILE_CHANNEL = "com.musereader/files"
         private const val ENGINE_CHANNEL = "com.musereader/musescore_engine"
         private const val PICK_SCORE_REQUEST = 4101
+        private const val PICK_FOLDER_REQUEST = 4102
         private const val IMPORT_DIRECTORY = "muse_reader/imports"
+        private const val FOLDER_PREFS = "muse_reader_folder"
+        private const val KEY_TREE_URI = "granted_tree_uri"
         private const val TAG = "MuseReaderAudio"
     }
 
     private var pendingFileResult: MethodChannel.Result? = null
+    private var pendingFolderResult: MethodChannel.Result? = null
     private lateinit var fallbackSynth: SimpleScoreSynth
     private lateinit var fluidSynth: FluidScoreSynth
     private val engineExecutor = Executors.newSingleThreadExecutor()
@@ -43,6 +49,60 @@ class MainActivity : FlutterActivity() {
                     "listImportedScoreFiles" -> result.success(
                         runCatching { listImportedScoreFiles() }.getOrDefault(emptyList()),
                     )
+                    "storedScoreFolderTree" -> result.success(
+                        folderPreferences().getString(KEY_TREE_URI, null),
+                    )
+                    "pickScoreFolder" -> pickScoreFolder(result)
+                    "listScoreFolderContents" -> {
+                        val treeUri = call.argument<String>("treeUri")
+                        val documentId = call.argument<String>("documentId") ?: ""
+                        if (treeUri.isNullOrBlank()) {
+                            result.error("folder_list_failed", "Missing treeUri.", null)
+                        } else {
+                            engineExecutor.execute {
+                                val payload = runCatching {
+                                    listScoreFolderContents(treeUri, documentId)
+                                }
+                                runOnUiThread {
+                                    payload.fold(
+                                        onSuccess = result::success,
+                                        onFailure = {
+                                            result.error(
+                                                "folder_list_failed",
+                                                it.message ?: "Cannot read the folder.",
+                                                null,
+                                            )
+                                        },
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    "importScoreFolder" -> {
+                        val treeUri = call.argument<String>("treeUri")
+                        val documentId = call.argument<String>("documentId") ?: ""
+                        if (treeUri.isNullOrBlank()) {
+                            result.error("folder_import_failed", "Missing treeUri.", null)
+                        } else {
+                            engineExecutor.execute {
+                                val payload = runCatching {
+                                    importScoreFolder(treeUri, documentId)
+                                }
+                                runOnUiThread {
+                                    payload.fold(
+                                        onSuccess = result::success,
+                                        onFailure = {
+                                            result.error(
+                                                "folder_import_failed",
+                                                it.message ?: "Cannot import the folder.",
+                                                null,
+                                            )
+                                        },
+                                    )
+                                }
+                            }
+                        }
+                    }
                     else -> result.notImplemented()
                 }
             }
@@ -144,22 +204,75 @@ class MainActivity : FlutterActivity() {
         startActivityForResult(intent, PICK_SCORE_REQUEST)
     }
 
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode != PICK_SCORE_REQUEST) return
-        val result = pendingFileResult
-        pendingFileResult = null
-        if (result == null) return
-        if (resultCode != Activity.RESULT_OK || data?.data == null) {
-            result.success(null)
+    private fun pickScoreFolder(result: MethodChannel.Result) {
+        if (pendingFolderResult != null || pendingFileResult != null) {
+            result.error("picker_busy", "A picker is already open.", null)
             return
         }
-        try {
-            result.success(copyToPersistentStorage(data.data!!))
-        } catch (error: Exception) {
-            result.error("copy_failed", error.message, null)
+        pendingFolderResult = result
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+            addFlags(
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                    Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION,
+            )
+        }
+        startActivityForResult(intent, PICK_FOLDER_REQUEST)
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        when (requestCode) {
+            PICK_SCORE_REQUEST -> {
+                val result = pendingFileResult
+                pendingFileResult = null
+                if (result == null) return
+                if (resultCode != Activity.RESULT_OK || data?.data == null) {
+                    result.success(null)
+                    return
+                }
+                try {
+                    result.success(copyToPersistentStorage(data.data!!))
+                } catch (error: Exception) {
+                    result.error("copy_failed", error.message, null)
+                }
+            }
+            PICK_FOLDER_REQUEST -> {
+                val result = pendingFolderResult
+                pendingFolderResult = null
+                if (result == null) return
+                if (resultCode != Activity.RESULT_OK || data?.data == null) {
+                    result.success(null)
+                    return
+                }
+                try {
+                    rememberFolderTree(data.data!!)
+                    result.success(data.data.toString())
+                } catch (error: Exception) {
+                    result.error("folder_pick_failed", error.message, null)
+                }
+            }
         }
     }
+
+    /**
+     * Keep the tree grant for later app launches: with the persisted
+     * permission the in-app directory browser can re-open the same folder
+     * without asking the system picker again. A provider that refuses to
+     * persist simply forces the picker on the next launch; the grant still
+     * covers the current process either way.
+     */
+    private fun rememberFolderTree(uri: Uri) {
+        runCatching {
+            contentResolver.takePersistableUriPermission(
+                uri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION,
+            )
+        }
+        folderPreferences().edit().putString(KEY_TREE_URI, uri.toString()).apply()
+    }
+
+    private fun folderPreferences() =
+        getSharedPreferences(FOLDER_PREFS, Context.MODE_PRIVATE)
 
     /**
      * Keep imported scores in the app's files directory instead of cacheDir.
@@ -208,6 +321,116 @@ class MainActivity : FlutterActivity() {
             )
             ?.map { it.absolutePath }
             ?: emptyList()
+    }
+
+    /**
+     * Import every valid score file found DIRECTLY inside the folder of a
+     * granted tree (non-recursive). The previous library is replaced: the
+     * replacement is staged before the old collection is removed, ordered
+     * by display name so the library keeps a stable,
+     * predictable collection. Each copy carries a descending modification
+     * time so the newest-first listing reproduces the import order after a
+     * process restart.
+     */
+    private fun importScoreFolder(treeUriString: String, documentId: String): List<String> {
+        val tree = Uri.parse(treeUriString)
+        val directory = importedScoresDirectory()
+        val children = treeChildren(tree, effectiveTreeDocumentId(tree, documentId))
+            .filter { row ->
+                row.mime != DocumentsContract.Document.MIME_TYPE_DIR &&
+                    isSupportedScoreFile(row.displayName)
+            }
+            .sortedBy { row -> row.displayName.lowercase() }
+        val base = System.currentTimeMillis()
+        return replaceImportedScores(directory) { staging ->
+            children.mapIndexed { index, row ->
+                val childUri = DocumentsContract.buildDocumentUriUsingTree(
+                    tree,
+                    row.documentId,
+                )
+                val safeName = row.displayName.replace(Regex("[^A-Za-z0-9._-]"), "_")
+                val target = File(staging, "${base - index}_$safeName")
+                contentResolver.openInputStream(childUri).use { input ->
+                    requireNotNull(input) { "Cannot open ${row.displayName}." }
+                    target.outputStream().use { output -> input.copyTo(output) }
+                }
+                target.setLastModified(base - index)
+                target.name
+            }
+        }
+    }
+
+    /**
+     * A blank document id means "the root of the granted tree". Providers
+     * cannot resolve "" as a parent document: the tree root must be addressed
+     * by the tree's own document id (for example "primary:Download").
+     */
+    private fun effectiveTreeDocumentId(tree: Uri, documentId: String): String {
+        if (documentId.isNotBlank()) return documentId
+        return runCatching { DocumentsContract.getTreeDocumentId(tree) }
+            .getOrDefault("")
+    }
+
+    /** Direct children of one folder inside a granted tree. */
+    private fun treeChildren(tree: Uri, documentId: String): List<ChildRow> {
+        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(
+            tree,
+            documentId,
+        )
+        val rows = mutableListOf<ChildRow>()
+        val cursor = contentResolver.query(
+            childrenUri,
+            arrayOf(
+                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                DocumentsContract.Document.COLUMN_MIME_TYPE,
+            ),
+            null,
+            null,
+            null,
+        ) ?: throw IllegalStateException("Cannot read the folder.")
+        cursor.use {
+            val idIndex = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+            val nameIndex = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+            val mimeIndex = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+            while (cursor.moveToNext()) {
+                rows += ChildRow(
+                    documentId = cursor.getString(idIndex) ?: "",
+                    displayName = cursor.getString(nameIndex) ?: "",
+                    mime = cursor.getString(mimeIndex) ?: "",
+                )
+            }
+        }
+        return rows
+    }
+
+    /** One row of a tree listing for the Flutter directory browser. */
+    private data class ChildRow(
+        val documentId: String,
+        val displayName: String,
+        val mime: String,
+    )
+
+    private fun listScoreFolderContents(
+        treeUriString: String,
+        documentId: String,
+    ): Map<String, Any> {
+        val tree = Uri.parse(treeUriString)
+        val folders = mutableListOf<Map<String, Any>>()
+        val scores = mutableListOf<String>()
+        for (row in treeChildren(tree, effectiveTreeDocumentId(tree, documentId))) {
+            if (row.mime == DocumentsContract.Document.MIME_TYPE_DIR) {
+                folders += mapOf(
+                    "documentId" to row.documentId,
+                    "name" to row.displayName,
+                )
+            } else if (isSupportedScoreFile(row.displayName)) {
+                scores += row.displayName
+            }
+        }
+        folders.sortBy { (it["name"] as String).lowercase() }
+        scores.sortBy { it.lowercase() }
+        return mapOf("folders" to folders, "scores" to scores)
     }
 
     private fun importedScoresDirectory(): File =

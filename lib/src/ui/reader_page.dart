@@ -4,38 +4,73 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 
 import '../model/score_document.dart';
+import '../model/score_library_entry.dart';
 import '../playback/playback_controller.dart';
+import '../playback/score_queue.dart';
 import 'score_page_painter.dart';
 
 class ReaderPage extends StatefulWidget {
-  const ReaderPage({super.key, required this.document});
+  const ReaderPage({
+    super.key,
+    required this.document,
+    this.queue,
+    this.loadEntry,
+  });
 
   final ScoreDocument document;
+
+  /// Play queue of the current collection, carrying the hidden golden-ratio
+  /// memory and the loop mode. When null (standalone usage, tests) the
+  /// previous/next/loop row is hidden and no auto-advance happens.
+  final ReaderQueue? queue;
+
+  /// Hydrates (opens + caches) one collection entry by its source path. Only
+  /// needed while [queue] is provided, because 上一首/下一首 and the end of a
+  /// piece may target any entry of the collection.
+  final Future<ScoreLibraryEntry> Function(String sourcePath)? loadEntry;
 
   @override
   State<ReaderPage> createState() => _ReaderPageState();
 }
 
 class _ReaderPageState extends State<ReaderPage> {
-  late final PlaybackController _playback;
-  final _scoreViewportKey = GlobalKey<_MultiPageScoreViewportState>();
+  static const _restartBackThresholdUs = 3 * 1000 * 1000;
+
+  late ScoreDocument _document;
+  late PlaybackController _playback;
+  GlobalKey<_MultiPageScoreViewportState> _scoreViewportKey =
+      GlobalKey<_MultiPageScoreViewportState>();
   int _visiblePage = 0;
+  bool _switching = false;
+  bool _wasPlaying = false;
 
   @override
   void initState() {
     super.initState();
-    _playback = PlaybackController(widget.document)
-      ..addListener(_onPlaybackChanged);
+    _document = widget.document;
+    _playback = PlaybackController(_document)..addListener(_onPlaybackChanged);
+    widget.queue
+      ?..setCurrentId(_document.sourcePath)
+      ..addListener(_onQueueChanged);
+  }
+
+  void _onQueueChanged() {
+    if (mounted) setState(() {});
   }
 
   void _onPlaybackChanged() {
     if (!mounted) return;
+    final wasPlaying = _wasPlaying;
+    _wasPlaying = _playback.isPlaying;
+    if (!wasPlaying && _wasPlaying) {
+      widget.queue?.recordCurrent();
+    }
     final cursor = _playback.cursorPosition;
     final page = cursor?.pageIndex ?? _playback.currentPage;
     final pageChanged = page != _visiblePage;
     if (pageChanged &&
         (_playback.isPlaying || _playback.cursorVisible) &&
-        widget.document.pages.isNotEmpty) {
+        _document.pages.isNotEmpty) {
       _visiblePage = page;
     }
     if (cursor != null && _playback.cursorVisible) {
@@ -46,18 +81,140 @@ class _ReaderPageState extends State<ReaderPage> {
     } else if (pageChanged && _playback.cursorVisible) {
       _scoreViewportKey.currentState?.focusPage(page, animate: !_reduceMotion);
     }
+    // A piece ended when playback stopped itself at the end of the document.
+    // The controller has no end callback, so infer it from the transition
+    // playing -> stopped with the position pinned at the duration.
+    final ended =
+        wasPlaying &&
+        !_playback.isPlaying &&
+        _playback.durationUs > 0 &&
+        _playback.positionUs >= _playback.durationUs;
     setState(() {});
+    if (ended) {
+      unawaited(_handlePieceEnded());
+    }
   }
 
   @override
   void dispose() {
+    widget.queue?.removeListener(_onQueueChanged);
     _playback.dispose();
     super.dispose();
   }
 
+  /// Playback of the current piece stopped at its end: follow the loop mode.
+  /// "播完停止" leaves the stopped state alone; every other mode hands the
+  /// turn to the next scheduled piece and keeps playing (单曲循环 replays the
+  /// same document).
+  Future<void> _handlePieceEnded() async {
+    final queue = widget.queue;
+    if (queue == null || _switching) return;
+    final index = queue.endOfPieceIndex();
+    if (index == null) return;
+    await _switchToPiece(queue.ids[index], autoplay: true);
+  }
+
+  /// The "next piece" control. Manual switches keep playing only when
+  /// playback was already running; otherwise the piece is loaded and left
+  /// paused at its start, mirroring the reference player.
+  Future<void> _goToNextPiece() async {
+    final queue = widget.queue;
+    if (queue == null || _switching) return;
+    final index = queue.manualNextIndex();
+    if (index == null) return;
+    await _switchToPiece(queue.ids[index], autoplay: _playback.isPlaying);
+  }
+
+  /// The "previous piece" control: walk the golden-ratio memory history
+  /// first; a piece that has not been played for long restarts instead; then
+  /// fall back to stepping back through the collection.
+  Future<void> _goToPreviousPiece() async {
+    final queue = widget.queue;
+    if (queue == null || _switching) return;
+    final autoplay = _playback.isPlaying;
+    final memoryTarget = queue.memoryPrevIndex();
+    if (memoryTarget != null) {
+      await _switchToPiece(queue.ids[memoryTarget], autoplay: autoplay);
+      return;
+    }
+    if (_playback.positionUs > _restartBackThresholdUs) {
+      if (autoplay) {
+        await _playback.restart();
+        await _play();
+      } else {
+        await _playback.restart();
+      }
+      return;
+    }
+    final stepBack = queue.stepBackIndex();
+    if (stepBack != null) {
+      await _switchToPiece(queue.ids[stepBack], autoplay: autoplay);
+      return;
+    }
+    if (autoplay) {
+      await _playback.restart();
+      await _play();
+    } else {
+      await _playback.restart();
+    }
+  }
+
+  Future<void> _play() async {
+    if (!mounted) return;
+    await _playback.play();
+  }
+
+  /// Load and open another collection entry, keeping the reader in place.
+  /// The score viewport is rebuilt under a fresh key so zoom and page state
+  /// never leak between pieces.
+  Future<void> _switchToPiece(String id, {required bool autoplay}) async {
+    final queue = widget.queue;
+    if (queue == null) return;
+    if (id == _document.sourcePath) {
+      // Same document (single-loop replay or restart): no load needed.
+      await _playback.restart();
+      if (autoplay) await _play();
+      return;
+    }
+    if (_switching) return;
+    final loader = widget.loadEntry;
+    if (loader == null) return;
+    setState(() => _switching = true);
+    ScoreLibraryEntry? hydrated;
+    try {
+      hydrated = await loader(id);
+    } on Object {
+      hydrated = null;
+    }
+    if (!mounted) return;
+    final document = hydrated?.document;
+    if (document == null) {
+      setState(() => _switching = false);
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(const SnackBar(content: Text('打开谱面失败')));
+      return;
+    }
+    _playback.dispose();
+    _document = document;
+    queue.setCurrentId(id);
+    _playback = PlaybackController(_document)..addListener(_onPlaybackChanged);
+    _scoreViewportKey = GlobalKey<_MultiPageScoreViewportState>();
+    _visiblePage = 0;
+    _wasPlaying = false;
+    setState(() => _switching = false);
+    if (autoplay) {
+      await _play();
+    }
+  }
+
+  void _selectLoop(PlayLoop loop) {
+    widget.queue?.setLoop(loop);
+  }
+
   Future<void> _changePage(int page) async {
-    if (widget.document.pages.isEmpty) return;
-    final next = page.clamp(0, widget.document.pages.length - 1).toInt();
+    if (_document.pages.isEmpty) return;
+    final next = page.clamp(0, _document.pages.length - 1).toInt();
     _visiblePage = next;
     _scoreViewportKey.currentState?.focusPage(next, animate: !_reduceMotion);
     if (!mounted) return;
@@ -76,8 +233,8 @@ class _ReaderPageState extends State<ReaderPage> {
     // MuseScore only treats score clicks specially while ViewState::PLAY is
     // active.  Pausing/stopping returns the desktop view to NORMAL, so a
     // reader tap outside active playback must remain inert as well.
-    if (!_playback.isPlaying) return;
-    final target = widget.document.playbackTimeAtPagePosition(
+    if (!_playback.isPlaying || _switching) return;
+    final target = _document.playbackTimeAtPagePosition(
       pageIndex,
       pagePosition.dx,
       pagePosition.dy,
@@ -91,15 +248,16 @@ class _ReaderPageState extends State<ReaderPage> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final active = _playback.activeEventIndexes.toSet();
+    final queue = widget.queue;
     return Scaffold(
       appBar: AppBar(
         leading: IconButton(
-          onPressed: () => Navigator.of(context).pop(),
+          onPressed: _switching ? null : () => Navigator.of(context).pop(),
           icon: const Icon(Icons.arrow_back),
           tooltip: '返回谱面库',
         ),
         title: Text(
-          widget.document.title,
+          _document.title,
           maxLines: 1,
           overflow: TextOverflow.ellipsis,
           style: theme.textTheme.titleMedium,
@@ -116,26 +274,75 @@ class _ReaderPageState extends State<ReaderPage> {
       body: Column(
         children: [
           Expanded(
-            child: ColoredBox(
-              color: theme.colorScheme.surfaceContainerHigh,
-              child: _MultiPageScoreViewport(
-                key: _scoreViewportKey,
-                document: widget.document,
-                activeEventIndexes: active,
-                playbackCursor: _playback.cursorPosition,
-                onPageTap: _onScorePageTap,
-                onPageChanged: (page) {
-                  if (page != _visiblePage && mounted) {
-                    setState(() => _visiblePage = page);
-                  }
-                },
-              ),
+            child: Stack(
+              children: [
+                Positioned.fill(
+                  child: ColoredBox(
+                    color: theme.colorScheme.surfaceContainerHigh,
+                    child: _MultiPageScoreViewport(
+                      key: _scoreViewportKey,
+                      document: _document,
+                      activeEventIndexes: active,
+                      playbackCursor: _playback.cursorPosition,
+                      onPageTap: _onScorePageTap,
+                      onPageChanged: (page) {
+                        if (page != _visiblePage && mounted) {
+                          setState(() => _visiblePage = page);
+                        }
+                      },
+                    ),
+                  ),
+                ),
+                if (_switching)
+                  Positioned.fill(
+                    child: ColoredBox(
+                      color: theme.colorScheme.surfaceContainerHigh.withValues(
+                        alpha: 0.72,
+                      ),
+                      child: Center(
+                        child: Card(
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 20,
+                              vertical: 16,
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                const SizedBox.square(
+                                  dimension: 20,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2.4,
+                                  ),
+                                ),
+                                const SizedBox(width: 14),
+                                Text(
+                                  '正在载入谱面…',
+                                  style: theme.textTheme.bodyMedium,
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+              ],
             ),
           ),
+          if (queue != null) ...[
+            _PieceSwitcherBar(
+              queue: queue,
+              enabled: !_switching,
+              onPrevious: _goToPreviousPiece,
+              onNext: _goToNextPiece,
+              onSelectLoop: _selectLoop,
+            ),
+          ],
           _TransportBar(
             playback: _playback,
             page: _visiblePage,
-            pageCount: widget.document.pages.length,
+            pageCount: _document.pages.length,
             onPageChanged: _changePage,
           ),
         ],
@@ -973,6 +1180,134 @@ class _PlaybackOverlayPainter extends CustomPainter {
       oldDelegate.pageWidth != pageWidth ||
       oldDelegate.pageHeight != pageHeight ||
       oldDelegate.color != color;
+}
+
+/// The previous-piece / next-piece / loop-mode row shown above the transport
+/// bar while the reader runs inside a collection (a [ReaderQueue] exists).
+/// Only these three items live here; the hidden golden-ratio memory list is
+/// deliberately never displayed.
+class _PieceSwitcherBar extends StatelessWidget {
+  const _PieceSwitcherBar({
+    required this.queue,
+    required this.enabled,
+    required this.onPrevious,
+    required this.onNext,
+    required this.onSelectLoop,
+  });
+
+  final ReaderQueue queue;
+  final bool enabled;
+  final VoidCallback onPrevious;
+  final VoidCallback onNext;
+  final ValueChanged<PlayLoop> onSelectLoop;
+
+  static IconData _loopIcon(PlayLoop loop) => switch (loop) {
+    PlayLoop.randomMemory => Icons.shuffle_rounded,
+    PlayLoop.sequential => Icons.repeat_rounded,
+    PlayLoop.single => Icons.repeat_one_rounded,
+    PlayLoop.none => Icons.stop_circle_outlined,
+  };
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final hasMultiple = queue.hasMultiple;
+    final loop = queue.loop;
+    final canSwitch = enabled && hasMultiple;
+    final loopOptions = hasMultiple
+        ? PlayLoop.values
+        : const <PlayLoop>[PlayLoop.single];
+    final switchButtons = [
+      IconButton(
+        onPressed: canSwitch ? onPrevious : null,
+        icon: const Icon(Icons.skip_previous_rounded),
+        color: theme.colorScheme.onSurfaceVariant,
+        tooltip: '上一首',
+      ),
+      const SizedBox(width: 4),
+      IconButton(
+        onPressed: canSwitch ? onNext : null,
+        icon: const Icon(Icons.skip_next_rounded),
+        color: theme.colorScheme.onSurfaceVariant,
+        tooltip: '下一首',
+      ),
+    ];
+    final loopButton = PopupMenuButton<PlayLoop>(
+      onSelected: enabled ? onSelectLoop : null,
+      tooltip: '循环模式',
+      itemBuilder: (context) => [
+        for (final option in loopOptions)
+          CheckedPopupMenuItem<PlayLoop>(
+            value: option,
+            checked: option == loop,
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(_loopIcon(option), size: 18),
+                const SizedBox(width: 10),
+                Text(option.label),
+              ],
+            ),
+          ),
+      ],
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+        decoration: BoxDecoration(
+          color: theme.colorScheme.surfaceContainerLow,
+          borderRadius: BorderRadius.circular(999),
+          border: Border.all(color: theme.colorScheme.outlineVariant),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              _loopIcon(loop),
+              size: 18,
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+            const SizedBox(width: 6),
+            Text(
+              queue.effectiveLoop.label,
+              maxLines: 1,
+              style: theme.textTheme.labelMedium?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+            const SizedBox(width: 2),
+            Icon(
+              Icons.arrow_drop_down_rounded,
+              size: 18,
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ],
+        ),
+      ),
+    );
+    return Material(
+      color: theme.colorScheme.surface,
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          border: Border(
+            top: BorderSide(color: theme.colorScheme.outlineVariant),
+          ),
+        ),
+        child: SafeArea(
+          top: false,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 2),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                ...switchButtons,
+                const SizedBox(width: 6),
+                loopButton,
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 class _TransportBar extends StatelessWidget {

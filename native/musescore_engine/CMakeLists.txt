@@ -183,6 +183,16 @@ if(MUSE_READER_WITH_MUSESCORE)
       MUSE_READER_RESOURCE_SOURCES
       "${MUSESCORE_BUILD_DIR}/muse_reader_resources.qrc"
     )
+    # The generated qrc source embeds the SoundFont as huge string literals
+    # (hundreds of MB of source). Optimizing it at the global -O3 release
+    # level exhausted the RAM of small build hosts; an unoptimized compile is
+    # a fraction of the cost and the data arrays need no optimization.
+    foreach(_qrc_source ${MUSE_READER_RESOURCE_SOURCES})
+      set_source_files_properties(
+        "${_qrc_source}"
+        PROPERTIES COMPILE_OPTIONS "-O0;-g0"
+      )
+    endforeach()
 
     if(NOT TARGET mops1)
       add_custom_target(mops1)

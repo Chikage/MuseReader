@@ -3,9 +3,11 @@ import 'package:flutter/material.dart';
 import '../model/score_document.dart';
 import '../model/score_library_entry.dart';
 import '../playback/playback_controller.dart';
+import '../playback/score_queue.dart';
 import '../services/file_picker_service.dart';
 import '../services/score_library_cache.dart';
 import '../services/score_repository.dart';
+import 'folder_picker_page.dart';
 import 'reader_page.dart';
 import 'score_page_painter.dart';
 
@@ -22,6 +24,22 @@ class _LibraryPageState extends State<LibraryPage> {
   final _libraryCache = ScoreLibraryCache();
   final _entries = <ScoreLibraryEntry>[];
   final _openingPaths = <String>{};
+
+  /// In-memory retention budget for fully opened score documents.
+  ///
+  /// Every hydrated [ScoreDocument] keeps all rendered page images and the
+  /// playback event list, so playing through a large collection must not
+  /// accumulate one document per piece. Only the [\_maxRetainedDocuments]
+  /// most recently used non-bundled documents stay loaded; older ones are
+  /// demoted back to metadata-only entries (cover + sidecar metadata) and
+  /// reopen cheaply from the gzipped document sidecar written by
+  /// [MuseScoreBridge] (no second native render).
+  static const _maxRetainedDocuments = 5;
+
+  /// Source paths of hydrated documents, most recently used first. Mirrors
+  /// the collection so eviction never touches an entry outside this list.
+  final _retentionOrder = <String>[];
+  ReaderQueue? _queue;
   bool _loading = true;
   String? _error;
   int _loadGeneration = 0;
@@ -55,9 +73,11 @@ class _LibraryPageState extends State<LibraryPage> {
       _entries
         ..clear()
         ..addAll(placeholders);
+      _retentionOrder.clear();
       _loading = false;
       _error = firstError;
     });
+    _syncQueue();
 
     // Metadata and thumbnail sidecars are small and can hydrate after the
     // first usable library frame. Full MuseScore documents are loaded only
@@ -87,6 +107,17 @@ class _LibraryPageState extends State<LibraryPage> {
     await _loadLibrary();
   }
 
+  /// (Re)create the play queue so it mirrors the collection shown by the
+  /// library. A fresh queue means a fresh golden-ratio memory: imports and
+  /// library reloads start a new session, exactly like reopening a folder in
+  /// the reference player.
+  void _syncQueue() {
+    final ids = [for (final entry in _entries) entry.sourcePath];
+    final previous = _queue;
+    _queue = ReaderQueue(ids: ids);
+    previous?.dispose();
+  }
+
   Future<void> _importScore() async {
     final path = await _picker.pickScoreFile();
     if (!mounted || path == null) return;
@@ -101,16 +132,105 @@ class _LibraryPageState extends State<LibraryPage> {
       _entries.insert(0, entry);
       _error = null;
     });
+    _syncQueue();
     await _openEntry(entry);
   }
 
+  /// Open the in-app directory browser. Confirming replaces the whole
+  /// collection with the valid scores of the chosen folder (the bundled demo
+  /// is no longer part of the collection afterwards, mirroring the reference
+  /// player where opening a folder replaces its playlist).
+  Future<void> _importFolder() async {
+    final paths = await Navigator.of(context).push<List<String>>(
+      MaterialPageRoute<List<String>>(
+        builder: (_) => FolderPickerPage(picker: _picker),
+      ),
+    );
+    if (!mounted || paths == null) return;
+    final seen = <String>{};
+    final uniquePaths = paths.where(seen.add).toList(growable: false);
+    final placeholders = [
+      for (final path in uniquePaths) ScoreLibraryEntry.placeholder(path),
+    ];
+    setState(() {
+      _entries
+        ..clear()
+        ..addAll(placeholders);
+      _retentionOrder.clear();
+      _loading = false;
+      _error = null;
+    });
+    _syncQueue();
+    _showMessage(
+      uniquePaths.isEmpty ? '所选目录中没有可用的谱面文件' : '已导入 ${uniquePaths.length} 份谱面',
+    );
+
+    // Metadata and thumbnail sidecars are small and can hydrate quietly; the
+    // documents themselves are still loaded lazily when a score is opened.
+    final cachedEntries = await Future.wait(
+      uniquePaths.map(_libraryCache.readOrPlaceholder),
+    );
+    if (!mounted) return;
+    setState(() {
+      for (final cached in cachedEntries) {
+        final index = _entries.indexWhere(
+          (entry) => entry.sourcePath == cached.sourcePath,
+        );
+        if (index >= 0 && _entries[index].document == null) {
+          _entries[index] = cached;
+        }
+      }
+    });
+  }
+
+  /// Open a score card: hydrate the document when needed, then push the
+  /// reader with the current play queue and a loader for neighbouring pieces.
   Future<void> _openEntry(ScoreLibraryEntry entry) async {
     final loaded = entry.document;
     if (loaded != null) {
-      _openDocument(loaded);
+      if (!entry.isBundled) _markRetained(entry.sourcePath);
+      _openReader(entry);
       return;
     }
-    if (!_openingPaths.add(entry.sourcePath)) return;
+    try {
+      final hydrated = await _loadEntryById(entry.sourcePath);
+      if (!mounted || hydrated.document == null) return;
+      _openReader(hydrated);
+    } catch (error) {
+      if (!mounted) return;
+      _showMessage('打开谱面失败');
+      setState(() => _error = '$error');
+    }
+  }
+
+  /// Load and hydrate one collection entry, keeping the library list in sync.
+  /// Used by the reader for 上一首/下一首/loop switches, which may target any
+  /// entry of the collection at any time.
+  Future<ScoreLibraryEntry> _loadEntryById(String sourcePath) async {
+    final indexOf = _entries.indexWhere(
+      (entry) => entry.sourcePath == sourcePath,
+    );
+    if (indexOf < 0) {
+      throw StateError('谱面不在当前谱面库中：$sourcePath');
+    }
+    final entry = _entries[indexOf];
+    final loaded = entry.document;
+    if (loaded != null) return entry;
+    if (!_openingPaths.add(sourcePath)) {
+      // Another request is hydrating the same entry (for example the card
+      // was opened twice in quick succession). Wait for it to settle.
+      while (mounted && _openingPaths.contains(sourcePath)) {
+        await Future<void>.delayed(const Duration(milliseconds: 60));
+      }
+      final settledIndex = _entries.indexWhere(
+        (item) => item.sourcePath == sourcePath,
+      );
+      final settled = settledIndex < 0 ? null : _entries[settledIndex];
+      if (settled?.document == null) {
+        throw StateError('谱面尚未就绪：$sourcePath');
+      }
+      return settled!;
+    }
     setState(() {});
     try {
       final document = entry.isBundled
@@ -119,30 +239,111 @@ class _LibraryPageState extends State<LibraryPage> {
       final hydrated = entry.isBundled
           ? ScoreLibraryEntry.fromDocument(document, assetPath: entry.assetPath)
           : await _libraryCache.write(document);
-      if (!mounted) return;
-      setState(() {
-        final index = _entries.indexWhere(
-          (item) => item.sourcePath == entry.sourcePath,
-        );
-        if (index >= 0) _entries[index] = hydrated;
-        _openingPaths.remove(entry.sourcePath);
-        _error = null;
-      });
-      _openDocument(document);
+      if (mounted) {
+        setState(() {
+          final index = _entries.indexWhere(
+            (item) => item.sourcePath == entry.sourcePath,
+          );
+          if (index >= 0 && _entries[index].document == null) {
+            _entries[index] = hydrated;
+          }
+          _openingPaths.remove(entry.sourcePath);
+          _error = null;
+          if (!entry.isBundled &&
+              index >= 0 &&
+              _entries[index].document != null) {
+            _retentionOrder
+              ..remove(entry.sourcePath)
+              ..insert(0, entry.sourcePath);
+          }
+        });
+        _trimRetainedDocuments();
+      }
+      return hydrated;
     } catch (error) {
-      if (!mounted) return;
-      setState(() {
-        _openingPaths.remove(entry.sourcePath);
-        _error = '$error';
-      });
-      _showMessage('打开谱面失败');
+      if (mounted) {
+        setState(() {
+          _openingPaths.remove(entry.sourcePath);
+          _error = '$error';
+        });
+      }
+      rethrow;
     }
   }
 
-  void _openDocument(ScoreDocument document) {
+  void _openReader(ScoreLibraryEntry entry) {
+    final queue = _queue;
+    final document = entry.document;
+    if (queue == null || document == null) return;
+    queue.setCurrentId(entry.sourcePath);
     Navigator.of(context).push(
-      MaterialPageRoute<void>(builder: (_) => ReaderPage(document: document)),
+      MaterialPageRoute<void>(
+        builder: (_) => ReaderPage(
+          document: document,
+          queue: queue,
+          loadEntry: _loadEntryById,
+        ),
+      ),
     );
+  }
+
+  /// Move a hydrated source path to the front of the retention order.
+  void _markRetained(String sourcePath) {
+    _retentionOrder
+      ..remove(sourcePath)
+      ..insert(0, sourcePath);
+  }
+
+  /// Metadata-only copy of a hydrated entry: the cover and sidecar metadata
+  /// stay so the card keeps its preview, but the heavy [ScoreDocument] is
+  /// released. Reopening later reloads the gzipped document sidecar (or the
+  /// native renderer as a fallback) on demand.
+  ScoreLibraryEntry _demotedCopy(ScoreLibraryEntry entry) {
+    return ScoreLibraryEntry(
+      sourcePath: entry.sourcePath,
+      fileName: entry.fileName,
+      format: entry.format,
+      title: entry.title,
+      composer: entry.composer,
+      pageCount: entry.pageCount,
+      durationUs: entry.durationUs,
+      coverBytes: entry.coverBytes,
+      assetPath: entry.assetPath,
+    );
+  }
+
+  /// Demote the least recently used documents beyond the retention budget
+  /// (bundled demo is never part of the budget). Keeps memory bounded when a
+  /// collection is played through continuously.
+  void _trimRetainedDocuments() {
+    if (!mounted || _retentionOrder.length <= _maxRetainedDocuments) return;
+    final demote = <String>[];
+    var retainedCount = 0;
+    for (final path in _retentionOrder) {
+      final hydrated = _entries.any(
+        (entry) =>
+            entry.sourcePath == path &&
+            !entry.isBundled &&
+            entry.document != null,
+      );
+      if (!hydrated) continue;
+      retainedCount += 1;
+      if (retainedCount > _maxRetainedDocuments) demote.add(path);
+    }
+    if (demote.isEmpty) return;
+    setState(() {
+      for (final path in demote) {
+        final index = _entries.indexWhere(
+          (entry) =>
+              entry.sourcePath == path &&
+              !entry.isBundled &&
+              entry.document != null,
+        );
+        if (index < 0) continue;
+        _entries[index] = _demotedCopy(_entries[index]);
+        _retentionOrder.remove(path);
+      }
+    });
   }
 
   void _showMessage(String message) {
@@ -182,6 +383,7 @@ class _LibraryPageState extends State<LibraryPage> {
                   sliver: SliverToBoxAdapter(
                     child: _LibraryHeader(
                       onImport: _loading ? null : _importScore,
+                      onOpenFolder: _loading ? null : _importFolder,
                       documentCount: _entries.length,
                       loading: _loading,
                     ),
@@ -217,7 +419,10 @@ class _LibraryPageState extends State<LibraryPage> {
                 else if (_entries.isEmpty)
                   SliverFillRemaining(
                     hasScrollBody: false,
-                    child: _EmptyLibrary(onImport: _importScore),
+                    child: _EmptyLibrary(
+                      onImport: _importScore,
+                      onOpenFolder: _importFolder,
+                    ),
                   )
                 else
                   _LibraryItems(
@@ -246,11 +451,13 @@ double _libraryHorizontalInset(double width) {
 class _LibraryHeader extends StatelessWidget {
   const _LibraryHeader({
     required this.onImport,
+    required this.onOpenFolder,
     required this.documentCount,
     required this.loading,
   });
 
   final VoidCallback? onImport;
+  final VoidCallback? onOpenFolder;
   final int documentCount;
   final bool loading;
 
@@ -275,14 +482,29 @@ class _LibraryHeader extends StatelessWidget {
       icon: const Icon(Icons.add_rounded),
       label: const Text('导入谱面'),
     );
+    final folderButton = FilledButton.tonalIcon(
+      onPressed: onOpenFolder,
+      icon: const Icon(Icons.add_rounded),
+      label: const Text('打开目录'),
+    );
     final scaledBody = MediaQuery.textScalerOf(context).scale(14);
     return LayoutBuilder(
       builder: (context, constraints) {
-        final stacked = constraints.maxWidth < 360 || scaledBody > 18;
+        final stacked = constraints.maxWidth < 520 || scaledBody > 18;
         if (stacked) {
           return Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [title, const SizedBox(height: 16), importButton],
+            children: [
+              title,
+              const SizedBox(height: 16),
+              Row(
+                children: [
+                  Expanded(child: importButton),
+                  const SizedBox(width: 12),
+                  Expanded(child: folderButton),
+                ],
+              ),
+            ],
           );
         }
         return Row(
@@ -291,6 +513,8 @@ class _LibraryHeader extends StatelessWidget {
             Expanded(child: title),
             const SizedBox(width: 24),
             importButton,
+            const SizedBox(width: 12),
+            folderButton,
           ],
         );
       },
@@ -727,9 +951,10 @@ class _LoadingScoreCard extends StatelessWidget {
 }
 
 class _EmptyLibrary extends StatelessWidget {
-  const _EmptyLibrary({required this.onImport});
+  const _EmptyLibrary({required this.onImport, required this.onOpenFolder});
 
   final VoidCallback onImport;
+  final VoidCallback onOpenFolder;
 
   @override
   Widget build(BuildContext context) {
@@ -752,6 +977,12 @@ class _EmptyLibrary extends StatelessWidget {
               onPressed: onImport,
               icon: const Icon(Icons.file_open_outlined),
               label: const Text('导入谱面'),
+            ),
+            const SizedBox(height: 12),
+            FilledButton.tonalIcon(
+              onPressed: onOpenFolder,
+              icon: const Icon(Icons.add_rounded),
+              label: const Text('打开目录'),
             ),
           ],
         ),
