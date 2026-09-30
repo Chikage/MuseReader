@@ -542,6 +542,9 @@ class _ReaderPageState extends State<ReaderPage> {
                             error: _playback is AudioPlaybackController
                                 ? (_playback as AudioPlaybackController).error
                                 : null,
+                            notice: _playback is AudioPlaybackController
+                                ? (_playback as AudioPlaybackController).notice
+                                : null,
                           ),
                   ),
                 ),
@@ -1582,11 +1585,16 @@ class _AudioPanel extends StatelessWidget {
     required this.item,
     required this.useInternalTitles,
     this.error,
+    this.notice,
   });
 
   final AudioItem item;
   final bool useInternalTitles;
   final String? error;
+
+  /// A recoverable playback problem (the system stopped the platform player):
+  /// shown so a paused piece is never a silent dead end.
+  final String? notice;
 
   @override
   Widget build(BuildContext context) {
@@ -1625,12 +1633,14 @@ class _AudioPanel extends StatelessWidget {
             ],
             const SizedBox(height: 18),
             Text(
-              error ?? '音频文件（无谱面）',
+              error ?? notice ?? '音频文件（无谱面）',
               textAlign: TextAlign.center,
               style: theme.textTheme.bodyMedium?.copyWith(
-                color: error == null
-                    ? theme.colorScheme.onSurfaceVariant
-                    : theme.colorScheme.error,
+                color: error != null
+                    ? theme.colorScheme.error
+                    : notice != null
+                    ? theme.colorScheme.primary
+                    : theme.colorScheme.onSurfaceVariant,
               ),
             ),
           ],

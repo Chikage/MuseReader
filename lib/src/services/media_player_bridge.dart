@@ -58,7 +58,22 @@ class MediaPlayerBridge {
     }
   }
 
-  static Future<void> play() => _invoke('play');
+  /// Starts (or resumes) the platform player. Returns false when the player is
+  /// no longer usable — for example after the system tore the audio output
+  /// away when another app came to the foreground. Callers must not assume
+  /// playback started: they rebuild the player and retry instead.
+  static Future<bool> play() async {
+    try {
+      return await _channel.invokeMethod<bool>('play') ?? false;
+    } on MissingPluginException {
+      return false;
+    } on PlatformException {
+      return false;
+    } on Object {
+      return false;
+    }
+  }
+
   static Future<void> pause() => _invoke('pause');
   static Future<void> stop() => _invoke('stop');
 

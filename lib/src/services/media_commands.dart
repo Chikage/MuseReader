@@ -2,7 +2,7 @@ import 'package:flutter/services.dart';
 
 /// Commands sent from the Android side of the app.
 ///
-/// Two kinds are used today:
+/// The kinds used today:
 ///  * `pause` — the stop action of the playback foreground-service
 ///    notification, so the reader can pause instead of silently going on;
 ///  * `memoryPressure` — `Activity.onTrimMemory` levels; the library releases
@@ -12,6 +12,9 @@ import 'package:flutter/services.dart';
 ///  * `scoreCompleted` — the FluidSynth renderer finished the score's audio
 ///    stream. This advances the queue even when the Dart timer that samples the
 ///    playback position is not being scheduled (screen off / app backgrounded).
+///
+/// There is deliberately no audio-focus event: playback does not take part in
+/// focus arbitration, so nothing the system announces can pause it.
 class MediaCommands {
   MediaCommands._();
 

@@ -51,6 +51,37 @@ mp4, m4b, wma, aif, aiff, amr, 3gp` 均可被单文件导入、目录导入与�
 时显示标签，关闭时显示文件名。音频条目的播放区域显示“音频文件（无谱面）”面板并隐藏
 页码导航，谱面与音频可混合在同一收藏中。
 
+### 音频播放的稳定性
+
+音频文件目前由 `MediaPlayer`（`MediaAudioPlayer`）播放：被系统扰动时会**短暂停顿并在
+同一位置继续**，这是当前稳定、可预期的行为。除此之外音频路径**不参与任何音频焦点
+协商**（不申请焦点、不 duck、不因系统通知暂停）：通知音、聊天窗口、其它播放器、来电
+与闹钟都不会让它停止播放；唯一的停止来源是用户、文件播完，或系统杀掉整个进程（前台
+服务 + 唤醒锁正是为防止后者）。
+
+- **不会再把“打断”误判为“播完”**：只有平台明确的 `mediaCompleted`（或停止位置已进
+  入时长末尾 250 ms 以内）才算一首播完并推进队列；中途停止一律先在当前位置重建播放器
+  继续（最多 3 次，仍失败才显示“播放被系统中断，请再次点击播放。”）。
+- **进程内解码（`DecodedAudioPlayer`，已实现但默认不启用）**：`MediaExtractor` 解封装、
+  `MediaCodec` 解码，PCM 写入我们自己的 `AudioTrack`（位置取自 `AudioTrackClock`，
+  与谱面同一套时钟），因此系统没有可接管的 media session。它由
+  `AudioFilePlayer.USE_IN_PROCESS_DECODER` 控制，当前为 `false`：在测试机
+  （NZONE S7 / Android 12）上 QQ 内窗仍会扰动音频输出，该管线的反应还在观察中，
+  保留代码以便后续启用。其中“播完”判定已加**呈现校验**：只有当音频确实播放到结尾
+  才上报完成；若输出失效（连续 3 次写入失败）则按失败处理（重建或回退），绝不当作
+  播完——这正是之前一次尝试中“被切歌”的原因。
+- **回退后端**：`MediaExtractor` 打不开的格式（通常是 wma/aiff/amr 变体）始终走
+  `MediaPlayer`，能力不缩水。
+- **前台服务与唤醒锁**：音频播放同样启动 `PlaybackService`（通知 + 部分唤醒锁），且
+  暂停不再停止服务——只要曲目仍处于已加载状态，进程与唤醒锁就保持；离开曲目
+  （`stop`）时才释放。
+- 诊断日志（供排查）：Dart 侧以 `flutter` 标签输出
+  `[MuseReader] audio: mediaCompleted -> piece ended`、
+  `platform stop at X ms of Y ms -> end of piece|interruption`、
+  `recovered at X ms`、`recovery failed after N attempt(s)`；Kotlin 侧为
+  `MuseReaderAudioFile`（后端选择）、`MuseReaderDecoded`（进程内解码/格式变化/失败）、
+  `MuseReaderMedia`（MediaPlayer 回退）。
+
 ## 目录授权（打开目录）
 
 首次使用需要系统 SAF 选择器（`ACTION_OPEN_DOCUMENT_TREE`）授权一个目录；授权后

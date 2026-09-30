@@ -51,7 +51,7 @@ class MainActivity : FlutterActivity() {
     private var pendingFileResult: MethodChannel.Result? = null
     private var pendingFolderResult: MethodChannel.Result? = null
     private var controlsChannel: MethodChannel? = null
-    private lateinit var mediaPlayer: MediaAudioPlayer
+    private lateinit var mediaPlayer: AudioFilePlayer
     private var renderWakeLock: android.os.PowerManager.WakeLock? = null
     private var screenReceiver: android.content.BroadcastReceiver? = null
     private var notificationPermissionAsked = false
@@ -83,7 +83,13 @@ class MainActivity : FlutterActivity() {
 
         // Audio-file playback (mp3/wav/ogg/flac/m4a/…). Engraved scores keep
         // using the MuseScore/FluidSynth engine channel.
-        mediaPlayer = MediaAudioPlayer(this)
+        //
+        // AudioFilePlayer decodes in-process by default and only falls back to
+        // MediaPlayer for files that pipeline cannot open. No audio focus is
+        // requested anywhere: the in-process path cannot be asked to pause, and
+        // a fallback player that politely paused on every focus loss is exactly
+        // the interruption this design removes.
+        mediaPlayer = AudioFilePlayer(this)
         mediaPlayer.onCompleted = {
             runOnUiThread {
                 runCatching { controls.invokeMethod("mediaCompleted", null) }
@@ -115,7 +121,12 @@ class MainActivity : FlutterActivity() {
                     }
                     "pause" -> {
                         mediaPlayer.pause()
-                        PlaybackService.stop(this@MainActivity)
+                        // The service deliberately survives a pause: the piece
+                        // stays loaded, so the process (and its wake lock) must
+                        // not become killable while another app is in front.
+                        // It is stopped when the piece is unloaded ("stop") or
+                        // when the reader leaves, exactly like the score path
+                        // keeps its service across a piece change.
                         result.success(null)
                     }
                     "stop" -> {

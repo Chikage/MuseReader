@@ -16,10 +16,20 @@ import java.io.File
  * MediaPlayer delivers its callbacks on the thread that created it, so this
  * class must be used from the main thread (the method-channel thread); only
  * [readMetadata] is safe to call from a worker.
+ *
+ * This is the fallback backend: audio files are normally decoded in-process
+ * by [DecodedAudioPlayer], which the system cannot interrupt. Files that
+ * pipeline cannot open (typically wma/aiff) still come through here, so this
+ * class deliberately takes part in nothing: it requests no audio focus and
+ * performs no ducking, so no notification, chat window or call can ask it to
+ * pause. A stop the system causes mid-file is reported (the player marks
+ * itself unprepared) instead of being mistaken for the end of the file, and
+ * the caller rebuilds it.
  */
 class MediaAudioPlayer(private val context: Context) {
     companion object {
         private const val TAG = "MuseReaderMedia"
+
 
         /** Embedded tag title/artist and duration of one audio file. */
         fun readMetadata(path: String): Map<String, Any?> {
@@ -50,7 +60,6 @@ class MediaAudioPlayer(private val context: Context) {
 
     private var player: MediaPlayer? = null
     private var prepared = false
-
     /** Invoked when the current file plays to its end. */
     var onCompleted: (() -> Unit)? = null
 
@@ -95,6 +104,10 @@ class MediaAudioPlayer(private val context: Context) {
                 onCompleted?.invoke()
             }
             mediaPlayer.setOnErrorListener { _, what, extra ->
+                // The player can die mid-file (the system reclaimed the audio
+                // output for another app). Mark it unprepared so play() reports
+                // the failure and the caller rebuilds it at the same position,
+                // instead of leaving a ▶ button that silently does nothing.
                 Log.w(TAG, "MediaPlayer error what=$what extra=$extra")
                 prepared = false
                 reply(
@@ -163,6 +176,11 @@ class MediaAudioPlayer(private val context: Context) {
 
     /** Releases the platform player; a later load() creates a new one. */
     fun stop() = release()
+
+
+
+
+
 
     private fun release() {
         val mediaPlayer = player

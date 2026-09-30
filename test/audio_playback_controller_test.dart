@@ -98,4 +98,127 @@ void main() {
     expect(controller.isPlaying, isFalse);
     controller.dispose();
   });
+
+  int loadCount() => calls.where((method) => method == 'load').length;
+
+  test('a mid-file stop is recovered instead of ending the piece', () async {
+    final controller = AudioPlaybackController('/audio/a.mp3');
+    await controller.play();
+    expect(loadCount(), 1);
+
+    // Another app took the audio output away in the middle of the file (this
+    // is what opening a QQ chat does): the platform player is gone, but the
+    // piece has not ended.
+    positionMs = 20000;
+    playing = false;
+    await Future<void>.delayed(const Duration(milliseconds: 120));
+
+    expect(
+      loadCount(),
+      greaterThan(1),
+      reason: 'the platform player is rebuilt at the same position',
+    );
+    expect(controller.isPlaying, isTrue, reason: 'playback continues');
+    expect(
+      controller.positionUs,
+      lessThan(controller.durationUs),
+      reason: 'an interruption is never snapped to the end',
+    );
+    expect(controller.notice, isNull);
+    controller.dispose();
+  });
+
+  test('play() rebuilds a platform player that no longer exists', () async {
+    // The first start fails because the platform player is gone; the rebuild
+    // that follows must succeed, so ▶ works without leaving the reader (the
+    // old behaviour left it dead until the piece was reopened from the list).
+    var playAttempts = 0;
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      calls.add(call.method);
+      switch (call.method) {
+        case 'load':
+          return <String, Object?>{'available': true, 'durationMs': 60000};
+        case 'play':
+          playAttempts += 1;
+          if (playAttempts == 1) return false;
+          playing = true;
+          return true;
+        case 'position':
+          return positionMs;
+        case 'isPlaying':
+          return playing;
+      }
+      return null;
+    });
+    final controller = AudioPlaybackController('/audio/a.mp3');
+    await controller.play();
+
+    expect(controller.isPlaying, isTrue);
+    expect(loadCount(), 2, reason: 'the dead player was rebuilt once');
+    expect(controller.notice, isNull);
+    controller.dispose();
+  });
+
+  test('a refused start reports a notice instead of a silent dead ▶', () async {
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      calls.add(call.method);
+      switch (call.method) {
+        case 'load':
+          return <String, Object?>{'available': true, 'durationMs': 60000};
+        case 'play':
+          return false;
+        case 'position':
+          return 12000;
+        case 'isPlaying':
+          return false;
+      }
+      return null;
+    });
+    final controller = AudioPlaybackController('/audio/a.mp3');
+    await controller.play();
+
+    expect(controller.isPlaying, isFalse);
+    expect(controller.positionUs, 0, reason: 'never snapped to the end');
+    expect(controller.notice, isNotNull);
+    expect(
+      loadCount(),
+      lessThanOrEqualTo(4),
+      reason: 'a broken file must not spin forever',
+    );
+    controller.dispose();
+  });
+
+  test('a stop away from the end is an interruption, never an ending', () async {
+    final controller = AudioPlaybackController('/audio/a.mp3');
+    await controller.play();
+
+    // 2 s before the end: the platform died, the piece did not finish.
+    playing = false;
+    positionMs = 58000;
+    await Future<void>.delayed(const Duration(milliseconds: 120));
+
+    expect(
+      controller.positionUs,
+      lessThan(controller.durationUs),
+      reason: 'the reader must not see "stopped at the duration"',
+    );
+    expect(loadCount(), greaterThan(1), reason: 'the player is rebuilt');
+    expect(controller.isPlaying, isTrue, reason: 'the piece continues');
+    expect(controller.notice, isNull);
+    controller.dispose();
+  });
+
+  test('a stop 400 ms before the end is no longer treated as the end', () async {
+    final controller = AudioPlaybackController('/audio/a.mp3');
+    await controller.play();
+
+    // Outside the 250 ms window: rebuild, do not snap to the duration.
+    playing = false;
+    positionMs = 59600;
+    await Future<void>.delayed(const Duration(milliseconds: 120));
+
+    expect(controller.positionUs, lessThan(controller.durationUs));
+    expect(loadCount(), greaterThan(1));
+    controller.dispose();
+  });
 }
