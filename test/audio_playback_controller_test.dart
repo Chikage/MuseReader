@@ -159,32 +159,43 @@ void main() {
     controller.dispose();
   });
 
-  test('a refused start reports a notice instead of a silent dead ▶', () async {
+  test('a refused start keeps retrying with a status line, not a dead ▶', () async {
+    var allowPlay = false;
     messenger.setMockMethodCallHandler(channel, (call) async {
       calls.add(call.method);
       switch (call.method) {
         case 'load':
           return <String, Object?>{'available': true, 'durationMs': 60000};
         case 'play':
-          return false;
+          if (!allowPlay) return false;
+          playing = true;
+          return true;
         case 'position':
           return 12000;
         case 'isPlaying':
-          return false;
+          return playing;
       }
       return null;
     });
-    final controller = AudioPlaybackController('/audio/a.mp3');
+    final controller = AudioPlaybackController(
+      '/audio/a.mp3',
+      retryWindow: const Duration(milliseconds: 800),
+      retryInterval: const Duration(milliseconds: 100),
+      fastRetryAttempts: 2,
+    );
     await controller.play();
 
-    expect(controller.isPlaying, isFalse);
+    expect(controller.isPlaying, isTrue, reason: 'the piece is still wanted');
+    expect(controller.error, isNull);
+    expect(controller.notice, AudioPlaybackController.recoveringNotice);
     expect(controller.positionUs, 0, reason: 'never snapped to the end');
-    expect(controller.notice, isNotNull);
-    expect(
-      loadCount(),
-      lessThanOrEqualTo(4),
-      reason: 'a broken file must not spin forever',
-    );
+
+    // The platform comes back: the next attempt reconnects mid-piece.
+    allowPlay = true;
+    await Future<void>.delayed(const Duration(milliseconds: 400));
+    expect(controller.isPlaying, isTrue);
+    expect(controller.notice, isNull);
+    expect(playing, isTrue);
     controller.dispose();
   });
 
@@ -219,6 +230,146 @@ void main() {
 
     expect(controller.positionUs, lessThan(controller.durationUs));
     expect(loadCount(), greaterThan(1));
+    controller.dispose();
+  });
+
+  /// Mock of a media server that was killed: every attempt fails with
+  /// MEDIA_ERROR_SERVER_DIED until [healthy] flips.
+  void mockServerDeath({required bool Function() healthy}) {
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      calls.add(call.method);
+      switch (call.method) {
+        case 'load':
+          if (healthy()) {
+            return <String, Object?>{'available': true, 'durationMs': 60000};
+          }
+          return <String, Object?>{
+            'available': false,
+            'error': '无法解码该音频文件（100/1）',
+          };
+        case 'play':
+          if (!healthy()) return false;
+          playing = true;
+          return true;
+        case 'position':
+          return 20000;
+        case 'isPlaying':
+          return playing;
+      }
+      return null;
+    });
+  }
+
+  test('an interruption retries fast at first, then one attempt per second', () async {
+    mockServerDeath(healthy: () => false);
+    final controller = AudioPlaybackController(
+      '/audio/a.mp3',
+      retryWindow: const Duration(seconds: 10),
+      retryInterval: const Duration(milliseconds: 300),
+      fastRetryAttempts: 3,
+    );
+    await controller.play();
+
+    // The burst goes out on the next poll ticks (the position timer runs every
+    // 50 ms) with no pacing gate until the fast attempts are used up.
+    await Future<void>.delayed(const Duration(milliseconds: 250));
+    expect(
+      controller.retryAttempts,
+      3,
+      reason: 'exactly the configured fast attempts, back to back',
+    );
+
+    await Future<void>.delayed(const Duration(milliseconds: 900));
+    final paced = controller.retryAttempts;
+    // 900 ms at 300 ms per attempt is at most ~3 more; the 50 ms poll must not
+    // turn this into ~18 attempts.
+    expect(paced, inInclusiveRange(4, 8), reason: 'paced, not hammered');
+    expect(controller.isPlaying, isTrue, reason: 'the piece is still wanted');
+    expect(controller.notice, AudioPlaybackController.recoveringNotice);
+    controller.dispose();
+  });
+
+  test('the budget runs out into a friendly error carrying the platform code', () async {
+    mockServerDeath(healthy: () => false);
+    final controller = AudioPlaybackController(
+      '/audio/a.mp3',
+      retryWindow: const Duration(milliseconds: 400),
+      retryInterval: const Duration(milliseconds: 100),
+      fastRetryAttempts: 2,
+    );
+    await controller.play();
+    expect(controller.error, isNull, reason: 'not yet: the budget is still open');
+
+    await Future<void>.delayed(const Duration(milliseconds: 800));
+    expect(controller.isPlaying, isFalse);
+    expect(controller.notice, isNull);
+    expect(controller.error, contains('（100/1）'));
+    expect(controller.error, contains('点击播放重试'));
+    controller.dispose();
+  });
+
+  test('a genuine decode error does not wait out the window', () async {
+    var serverDied = false;
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      calls.add(call.method);
+      switch (call.method) {
+        case 'load':
+          if (!serverDied) {
+            return <String, Object?>{'available': true, 'durationMs': 60000};
+          }
+          return <String, Object?>{
+            'available': false,
+            'error': '无法解码该音频文件（1/1）',
+          };
+        case 'play':
+          if (serverDied) return false;
+          playing = true;
+          return true;
+        case 'position':
+          return 20000;
+        case 'isPlaying':
+          return playing;
+      }
+      return null;
+    });
+    final controller = AudioPlaybackController(
+      '/audio/a.mp3',
+      retryWindow: const Duration(seconds: 10),
+      retryInterval: const Duration(milliseconds: 100),
+      fastRetryAttempts: 2,
+    );
+    await controller.play();
+
+    // The player dies and the file turns out to be undecodable: report it
+    // quickly instead of retrying for the whole window.
+    serverDied = true;
+    playing = false;
+    await Future<void>.delayed(const Duration(milliseconds: 600));
+
+    expect(controller.error, isNotNull);
+    expect(controller.error, contains('（1/1）'));
+    expect(controller.isPlaying, isFalse);
+    controller.dispose();
+  });
+
+  test('pressing play after the budget is spent starts a fresh cycle', () async {
+    var healthy = false;
+    mockServerDeath(healthy: () => healthy);
+    final controller = AudioPlaybackController(
+      '/audio/a.mp3',
+      retryWindow: const Duration(milliseconds: 300),
+      retryInterval: const Duration(milliseconds: 100),
+      fastRetryAttempts: 2,
+    );
+    await controller.play();
+    await Future<void>.delayed(const Duration(milliseconds: 700));
+    expect(controller.error, isNotNull);
+
+    healthy = true;
+    await controller.play();
+    expect(controller.isPlaying, isTrue);
+    expect(controller.error, isNull);
+    expect(controller.notice, isNull);
     controller.dispose();
   });
 }
